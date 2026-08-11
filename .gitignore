@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Local secrets / runtime (never commit real credentials)
+config/config.ini
+firmware/include/secrets.h
+data/*
+!data/.gitkeep
+logs/
+*.log
+
+# Build junk (keep .spec and dist EXEs for ready-to-run Windows use)
+build/
+firmware/.pio/
+
+# Dist runtime leftovers (keep EXEs + service scripts + bats)
+dist/data/
+dist/logs/
+dist/config/config.ini
+dist/firmware/include/secrets.h
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

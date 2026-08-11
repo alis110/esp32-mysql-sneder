@@ -1,0 +1,18 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: plcbridge-lab-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: labroot
+      MYSQL_DATABASE: plcbridge_lab
+      MYSQL_USER: bridge
+      MYSQL_PASSWORD: bridge
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ubridge", "-pbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
