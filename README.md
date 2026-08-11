@@ -1,12 +1,14 @@
 # ESP32 MySQL Sender (PLCBridge)
 
+**Author:** [Ali Sadeghi](https://github.com/alis110) (`@alis110`) · `alisadeghi201@gmail.com`
+
 A light, durable bridge that reads rows from a local Windows MySQL database and delivers them to a REST API through:
 
 ```text
 MySQL  →  Python Bridge (Windows Service)  →  USB Serial  →  ESP32  →  Wi-Fi  →  HTTPS/HTTP API
 ```
 
-GitHub: [alis110/esp32-mysql-sneder](https://github.com/alis110/esp32-mysql-sneder)
+Repository: [alis110/esp32-mysql-sneder](https://github.com/alis110/esp32-mysql-sneder)
 
 This project **does not guess your schema**. You must set a real SQL query in the config. No data is read or sent until `enabled=true` and a valid query are configured.
 
@@ -407,3 +409,16 @@ Copy from `*.example*` / `config.lab.ini` for local use.
 ## Usage note
 
 Ready for factory deployment and local lab testing. Always validate the query and indexes with a read-only account before pointing at production MySQL.
+
+---
+
+## Author
+
+| | |
+|--|--|
+| **Name** | Ali Sadeghi |
+| **GitHub** | [@alis110](https://github.com/alis110) |
+| **Email** | alisadeghi201@gmail.com |
+| **Repository** | [alis110/esp32-mysql-sneder](https://github.com/alis110/esp32-mysql-sneder) |
+
+Copyright © Ali Sadeghi. All rights reserved unless otherwise noted.
