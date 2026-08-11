@@ -1,41 +1,28 @@
-# Offline packs for factory Windows PCs (NO internet at site)
+# Offline packs for factory Windows PCs (NO internet on site)
 
-## What is here
+See **[MANIFEST.md](MANIFEST.md)** for the full file list.
 
-| Folder / file | Purpose | Internet at factory? |
-|---------------|---------|----------------------|
-| `cp2102\` | Silicon Labs CP210x driver (ZIP + extracted INF/EXE) | **No** |
-| `portable-python\` | Portable Python 3.11 + PlatformIO (`pio`) | **No** |
-| `platformio-wheels\` | pip wheels used to build portable PIO | (already installed) |
-| `platformio-home\` | ESP32 toolchains / frameworks (~1 GB) | **No** |
-| `Install-Offline.bat` | One-click install on factory PC | **No** |
-| `Prepare-OfflinePack.ps1` | Rebuild this pack on a PC **with** internet | Yes (dev machine) |
-
-## Factory PC (no internet)
-
-1. Copy the whole project USB stick to e.g. `C:\PLCBridge\` (must include `tools\offline\` fully).
-2. Run:
+## Install on factory PC
 
 ```text
 tools\offline\Install-Offline.bat
 ```
 
-3. Accept Windows driver / UAC prompts.
-4. Open a **new** PowerShell:
+Installs in order (all from local files):
 
-```powershell
-pio --version
-Get-CimInstance Win32_SerialPort | Format-Table DeviceID, Name
+1. **Visual C++ Redistributable** (needed by `PLCBridge.exe` / Setup)
+2. **CP2102** Silicon Labs driver
+3. **Portable PlatformIO** + ESP32 toolchains → `C:\PLCBridge\offline\`
+
+Then open a **new** PowerShell and run `dist\PLCBridgeSetup.exe`.
+
+## Optional: flash without compiling
+
+```text
+tools\offline\Upload-Prebuilt-Firmware.bat COM7
 ```
 
-5. Run `dist\PLCBridgeSetup.exe` → **Setup ESP32**.
-
-Installer copies tools to `C:\PLCBridge\offline\` and sets:
-
-- User `PATH` → `C:\PLCBridge\offline\portable-python\Scripts`
-- User `PLATFORMIO_CORE_DIR` → `C:\PLCBridge\offline\platformio-home`
-
-## Rebuild pack (on a PC with internet)
+## Rebuild pack (PC with internet)
 
 ```powershell
 cd tools\offline
@@ -44,6 +31,6 @@ powershell -ExecutionPolicy Bypass -File .\Prepare-OfflinePack.ps1
 
 ## Notes
 
-- `platformio-home` is large (~1 GB). Keep it on the USB; it is gitignored.
-- `cp2102` driver files are small and can stay in git.
-- Bridge EXEs still do not need Python; `pio` is only for flashing.
+- Keep the whole `tools\offline\` folder on the USB (~1.3 GB).
+- Large toolchains are gitignored; they live on your prepared disk/USB.
+- Small installers (`cp2102`, `vcredist`, scripts, `firmware-bin`) can ship with the repo.

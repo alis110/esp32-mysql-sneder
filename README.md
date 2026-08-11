@@ -80,7 +80,13 @@ Copy the whole project (or at least `dist/` + `tools/` + `firmware/`) to a USB s
 
 ### Fast path — offline USB (recommended for factory with NO internet)
 
-This repo can ship a full offline pack under `tools/offline/` (CP2102 driver + portable `pio` + ESP32 toolchains, ~1 GB+).
+This repo can ship a full offline pack under `tools/offline/` (~1.3 GB):
+
+- Microsoft **VC++ Redistributable** (for the EXEs)
+- **CP2102** Silicon Labs driver
+- Portable **PlatformIO (`pio`)** + ESP32 toolchains
+- Prebuilt **firmware.bin** (optional flash without compile)
+- Vendored **ArduinoJson** under `firmware/lib/`
 
 **On the factory PC:**
 
