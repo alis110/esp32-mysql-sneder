@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -28,17 +29,22 @@ SECRETS_H = ROOT / "firmware" / "include" / "secrets.h"
 LAB_CONFIG = ROOT / "config" / "config.lab.ini"
 MOCK_API_PORT = 8089
 
-# Filled by LabApp so the HTTP handler can push into the UI log.
+# Filled by LabApp so the HTTP handler can push into the UI API Activity panel.
 _API_LOG: queue.Queue[str] | None = None
 _API_HIT_COUNT = 0
 _API_HIT_LOCK = threading.Lock()
+_API_LAST_HIT: str = ""
+
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
 
 
 class _MockApiHandler(BaseHTTPRequestHandler):
     server_version = "PLCBridgeMockAPI/1.0"
 
     def do_POST(self) -> None:  # noqa: N802
-        global _API_HIT_COUNT
+        global _API_HIT_COUNT, _API_LAST_HIT
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else b""
         try:
@@ -48,17 +54,23 @@ class _MockApiHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"ok":false,"error":"invalid_json"}')
-            self._ui(f"API ← BAD JSON from {self.client_address[0]}")
+            self._ui(f"[{_ts()}] BAD JSON from {self.client_address[0]}")
             return
 
         idem = self.headers.get("Idempotency-Key", "")
+        auth = self.headers.get("Authorization", "")
         with _API_HIT_LOCK:
             _API_HIT_COUNT += 1
             n = _API_HIT_COUNT
+            _API_LAST_HIT = _ts()
         pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+        auth_s = (auth[:28] + "…") if len(auth) > 28 else (auth or "-")
         self._ui(
-            f"API hit #{n} from {self.client_address[0]} path={self.path}\n"
-            f"Idempotency-Key: {idem}\n{pretty}"
+            f"[{_ts()}] HIT #{n} ← {self.client_address[0]} {self.command} {self.path}\n"
+            f"  Idempotency-Key: {idem or '-'}\n"
+            f"  Authorization: {auth_s}\n"
+            f"{pretty}\n"
+            f"{'─' * 40}"
         )
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -68,12 +80,31 @@ class _MockApiHandler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, fmt: str, *args) -> None:
-        self._ui("API access: " + (fmt % args))
+        self._ui(f"[{_ts()}] access {self.client_address[0]} — " + (fmt % args))
 
     @staticmethod
     def _ui(msg: str) -> None:
         if _API_LOG is not None:
             _API_LOG.put(msg)
+
+
+def probe_api_url(url: str) -> tuple[bool, str]:
+    """TCP reachability of API host:port from this PC (not ESP's Wi-Fi path)."""
+    from urllib.parse import urlparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return False, "no URL"
+    try:
+        u = urlparse(raw)
+        host = u.hostname
+        if not host:
+            return False, "bad URL"
+        port = u.port or (443 if (u.scheme or "").lower() == "https" else 80)
+        with socket.create_connection((host, port), timeout=2.0):
+            return True, f"OK {host}:{port}"
+    except OSError as exc:
+        return False, f"FAIL {exc}"
 
 
 def start_embedded_mock_api(port: int = MOCK_API_PORT) -> ThreadingHTTPServer:
@@ -526,6 +557,8 @@ class LabApp(tk.Tk):
     _ACCENT_HOVER = "#0D9488"
     _DANGER = "#B91C1C"
     _LOG_BG = "#F8FAFC"
+    _OK = "#047857"
+    _BAD = "#B91C1C"
     _FONT = ("Segoe UI", 9)
     _FONT_BOLD = ("Segoe UI Semibold", 9)
     _FONT_TITLE = ("Segoe UI Semibold", 12)
@@ -534,14 +567,22 @@ class LabApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PLCBridge Setup")
-        self.geometry("720x640")
-        self.minsize(640, 560)
+        self.geometry("1120x720")
+        self.minsize(900, 620)
         self._log_q: queue.Queue[str] = queue.Queue()
+        self._api_log_q: queue.Queue[str] = queue.Queue()
+        self._esp_log_q: queue.Queue[str] = queue.Queue()
         self._mock_httpd: ThreadingHTTPServer | None = None
         self._bridge_proc: subprocess.Popen | None = None
         self._api_hits = 0
+        self._esp_ser = None
+        self._esp_reader_stop = threading.Event()
+        self._esp_monitor_on = False
+        self._status_snapshot: dict[str, str] = {}
+        self._bridge_log_pos: dict[str, int] = {}
+        self._live_busy = False
         global _API_LOG
-        _API_LOG = self._log_q
+        _API_LOG = self._api_log_q
         self._clip_menu = tk.Menu(self, tearoff=0)
         self._clip_menu.add_command(label="Cut", command=lambda: self._clip_action("cut"))
         self._clip_menu.add_command(label="Copy", command=lambda: self._clip_action("copy"))
@@ -554,8 +595,14 @@ class LabApp(tk.Tk):
         self._build()
         self._enable_clipboard(self)
         self._bind_clipboard_widget(self.txt)
+        self._bind_clipboard_widget(self.txt_api)
+        self._bind_clipboard_widget(self.txt_esp)
         self.after(200, self._drain_log)
-        self.refresh_status()
+        self.after(200, self._drain_api_log)
+        self.after(200, self._drain_esp_log)
+        self.refresh_status(silent=False)
+        self.after(4000, self._live_tick)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_theme(self) -> None:
         self.configure(bg=self._BG)
@@ -590,6 +637,9 @@ class LabApp(tk.Tk):
         style.configure("Field.TLabel", background=self._CARD, foreground=self._MUTED, font=self._FONT)
         style.configure("StatusKey.TLabel", background=self._CARD, foreground=self._MUTED, font=("Segoe UI", 8))
         style.configure("StatusVal.TLabel", background=self._CARD, foreground=self._TEXT, font=self._FONT)
+        style.configure("Ok.TLabel", background=self._CARD, foreground=self._OK, font=self._FONT_BOLD)
+        style.configure("Bad.TLabel", background=self._CARD, foreground=self._BAD, font=self._FONT_BOLD)
+        style.configure("Warn.TLabel", background=self._CARD, foreground="#B45309", font=self._FONT)
 
         style.configure(
             "TEntry",
@@ -813,6 +863,179 @@ class LabApp(tk.Tk):
             pass
         self.log("Log cleared.")
 
+    def _copy_esp_log(self) -> None:
+        try:
+            text = self.txt_esp.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.log("ESP32 log copied to clipboard.")
+        except tk.TclError as exc:
+            self.log(f"Copy ESP32 log failed: {exc}")
+
+    def _clear_esp_log(self) -> None:
+        try:
+            self.txt_esp.delete("1.0", tk.END)
+        except tk.TclError:
+            pass
+
+    def _copy_api_log(self) -> None:
+        try:
+            text = self.txt_api.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.log("API activity copied to clipboard.")
+        except tk.TclError as exc:
+            self.log(f"Copy API log failed: {exc}")
+
+    def _clear_api_log(self) -> None:
+        try:
+            self.txt_api.delete("1.0", tk.END)
+        except tk.TclError:
+            pass
+
+    def _api_log(self, msg: str) -> None:
+        self._api_log_q.put(msg)
+
+    def _drain_api_log(self) -> None:
+        while True:
+            try:
+                msg = self._api_log_q.get_nowait()
+            except queue.Empty:
+                break
+            self.txt_api.insert(tk.END, msg if msg.endswith("\n") else msg + "\n")
+            self.txt_api.see(tk.END)
+        self.after(120, self._drain_api_log)
+
+    def _esp_log(self, msg: str) -> None:
+        self._esp_log_q.put(msg)
+
+    def _drain_esp_log(self) -> None:
+        while True:
+            try:
+                msg = self._esp_log_q.get_nowait()
+            except queue.Empty:
+                break
+            self.txt_esp.insert(tk.END, msg)
+            if not msg.endswith("\n"):
+                self.txt_esp.insert(tk.END, "\n")
+            self.txt_esp.see(tk.END)
+        self.after(120, self._drain_esp_log)
+
+    def _set_esp_monitor_ui(self, running: bool, detail: str = "") -> None:
+        self._esp_monitor_on = running
+        if hasattr(self, "btn_esp_start"):
+            state_start = tk.DISABLED if running else tk.NORMAL
+            state_stop = tk.NORMAL if running else tk.DISABLED
+            self.btn_esp_start.configure(state=state_start)
+            self.btn_esp_stop.configure(state=state_stop)
+        if hasattr(self, "lbl_esp_mon"):
+            if running:
+                self.lbl_esp_mon.configure(text=detail or "listening…")
+            else:
+                self.lbl_esp_mon.configure(text=detail or "stopped")
+
+    def stop_esp_monitor(self, note: str | None = None) -> None:
+        self._esp_reader_stop.set()
+        ser = self._esp_ser
+        self._esp_ser = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._set_esp_monitor_ui(False, note or "stopped")
+        if note:
+            self.log(note)
+
+    def start_esp_monitor(self) -> None:
+        if self._esp_monitor_on:
+            self.log("ESP32 serial monitor already running.")
+            return
+        svc = self._service_state()
+        if "RUNNING" in svc.upper():
+            if not messagebox.askyesno(
+                "ESP32 serial",
+                "PLCBridge Service is RUNNING and usually holds the COM port.\n\n"
+                "Stop the service and open ESP32 serial monitor?",
+            ):
+                return
+            try:
+                subprocess.run(
+                    ["sc", "stop", "PLCBridge"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=_create_no_window(),
+                )
+            except OSError as exc:
+                self.log(f"Could not stop service: {exc}")
+            time.sleep(1.0)
+
+        port = self._esp_port()
+        if not port:
+            messagebox.showwarning("ESP32 serial", "ESP32 COM port not found. Plug USB or set COM Port.")
+            return
+
+        import serial
+
+        self.stop_esp_monitor()
+        self._esp_reader_stop.clear()
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=115200,
+                timeout=0.25,
+                write_timeout=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "ESP32 serial",
+                f"Cannot open {port}:\n{exc}\n\nStop Bridge Service / close other serial tools first.",
+            )
+            return
+
+        self._esp_ser = ser
+        self._set_esp_monitor_ui(True, f"listening {port} @115200")
+        self.log(f"ESP32 serial monitor started on {port}")
+        self._esp_log(f"--- opened {port} @115200 ---\n")
+
+        def reader() -> None:
+            buf = ""
+            try:
+                while not self._esp_reader_stop.is_set():
+                    try:
+                        chunk = ser.read(256)
+                    except Exception as exc:  # noqa: BLE001
+                        self._esp_log(f"[serial error] {exc}\n")
+                        break
+                    if not chunk:
+                        continue
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                    except Exception:  # noqa: BLE001
+                        text = repr(chunk)
+                    buf += text
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        self._esp_log(line.rstrip("\r") + "\n")
+                if buf.strip():
+                    self._esp_log(buf)
+            finally:
+                try:
+                    ser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._esp_ser is ser:
+                    self._esp_ser = None
+                self.after(0, lambda: self._set_esp_monitor_ui(False, "stopped"))
+
+        threading.Thread(target=reader, daemon=True, name="esp-serial").start()
+
+    def _on_close(self) -> None:
+        self.destroy()
+
     def _enable_clipboard(self, root: tk.Misc) -> None:
         editable = {"Entry", "TEntry", "TCombobox", "Text"}
 
@@ -873,11 +1096,11 @@ class LabApp(tk.Tk):
             style='Subtitle.TLabel',
         ).pack(side=tk.LEFT, pady=2)
 
-        status = ttk.LabelFrame(frm, text=' Status ', padding=(6, 4))
+        status = ttk.LabelFrame(frm, text=' Live status (auto-refresh) ', padding=(6, 4))
         status.grid(row=1, column=0, sticky=tk.EW, pady=(0, 4))
         status_grid = ttk.Frame(status, style='Card.TFrame')
         status_grid.pack(fill=tk.X)
-        for c in range(3):
+        for c in range(4):
             status_grid.columnconfigure(c, weight=1)
 
         def status_cell(parent: ttk.Frame, r: int, c: int, key: str) -> ttk.Label:
@@ -888,12 +1111,16 @@ class LabApp(tk.Tk):
             val.pack(anchor=tk.W)
             return val
 
-        self.lbl_esp = status_cell(status_grid, 0, 0, 'ESP32')
-        self.lbl_wifi = status_cell(status_grid, 0, 1, 'Wi-Fi')
+        self.lbl_esp = status_cell(status_grid, 0, 0, 'ESP32 USB')
+        self.lbl_wifi = status_cell(status_grid, 0, 1, 'PC Wi-Fi')
         self.lbl_mysql = status_cell(status_grid, 0, 2, 'MySQL')
-        self.lbl_api = status_cell(status_grid, 1, 0, 'Mock API')
-        self.lbl_svc = status_cell(status_grid, 1, 1, 'Service')
+        self.lbl_api_target = status_cell(status_grid, 0, 3, 'Target API (from PC)')
+        self.lbl_api = status_cell(status_grid, 1, 0, 'Mock API listener')
+        self.lbl_svc = status_cell(status_grid, 1, 1, 'Bridge Service')
         self.lbl_ui_boot = status_cell(status_grid, 1, 2, 'UI at login')
+        self.lbl_live = status_cell(status_grid, 1, 3, 'Watch')
+        self.lbl_live.configure(text='every 4s · changes → App Log')
+
 
         cfg = ttk.LabelFrame(frm, text=' Settings ', padding=(6, 4))
         cfg.grid(row=2, column=0, sticky=tk.EW, pady=(0, 4))
@@ -1001,27 +1228,78 @@ class LabApp(tk.Tk):
             side=tk.LEFT, padx=(0, 3)
         )
         ttk.Button(row2, text='Hide UI login', command=self.disable_ui_at_login).pack(side=tk.LEFT)
+        ttk.Button(row2, text='CP2102 + PIO tools', command=self.open_factory_tools).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
 
-        log_box = ttk.LabelFrame(frm, text=' Log ', padding=(6, 4))
-        log_box.grid(row=4, column=0, sticky=tk.NSEW)
-        log_box.rowconfigure(1, weight=1)
-        log_box.columnconfigure(0, weight=1)
+        log_panes = ttk.Panedwindow(frm, orient=tk.HORIZONTAL)
+        log_panes.grid(row=4, column=0, sticky=tk.NSEW)
 
-        log_bar = ttk.Frame(log_box, style='Card.TFrame')
-        log_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 3))
+        def make_log_pane(title: str, hint: str):
+            box = ttk.LabelFrame(log_panes, text=title, padding=(6, 4))
+            box.rowconfigure(1, weight=1)
+            box.columnconfigure(0, weight=1)
+            bar = ttk.Frame(box, style='Card.TFrame')
+            bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 3))
+            txt = scrolledtext.ScrolledText(box, height=8, wrap=tk.WORD)
+            self._style_text(txt)
+            txt.grid(row=1, column=0, sticky=tk.NSEW)
+            return box, bar, txt, hint
+
+        log_box, log_bar, self.txt, _ = make_log_pane(' App Log ', '')
         ttk.Button(log_bar, text='Copy', style='Ghost.TButton', command=self._copy_log_all).pack(
             side=tk.LEFT
         )
         ttk.Button(log_bar, text='Clear', style='Ghost.TButton', command=self._clear_log).pack(
             side=tk.LEFT, padx=(4, 0)
         )
-        ttk.Label(log_bar, text='Ctrl+A / Ctrl+C / right-click', style='Muted.TLabel').pack(
+        ttk.Label(log_bar, text='Setup · status changes · Bridge file', style='Muted.TLabel').pack(
             side=tk.LEFT, padx=8
         )
 
-        self.txt = scrolledtext.ScrolledText(log_box, height=8, wrap=tk.WORD)
-        self._style_text(self.txt)
-        self.txt.grid(row=1, column=0, sticky=tk.NSEW)
+        api_box, api_bar, self.txt_api, _ = make_log_pane(' API Activity ', '')
+        ttk.Button(api_bar, text='Copy', style='Ghost.TButton', command=self._copy_api_log).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(api_bar, text='Clear', style='Ghost.TButton', command=self._clear_api_log).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+        ttk.Button(api_bar, text='Probe API', command=self.probe_target_api).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Label(api_bar, text='Mock POSTs · reachability', style='Muted.TLabel').pack(
+            side=tk.LEFT, padx=8
+        )
+
+        esp_box = ttk.LabelFrame(log_panes, text=' ESP32 Serial ', padding=(6, 4))
+        esp_box.rowconfigure(1, weight=1)
+        esp_box.columnconfigure(0, weight=1)
+        esp_bar = ttk.Frame(esp_box, style='Card.TFrame')
+        esp_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 3))
+        self.btn_esp_start = ttk.Button(
+            esp_bar, text='Start', style='Accent.TButton', command=self.start_esp_monitor
+        )
+        self.btn_esp_start.pack(side=tk.LEFT)
+        self.btn_esp_stop = ttk.Button(
+            esp_bar, text='Stop', style='Danger.TButton', command=lambda: self.stop_esp_monitor()
+        )
+        self.btn_esp_stop.pack(side=tk.LEFT, padx=(4, 0))
+        self.btn_esp_stop.configure(state=tk.DISABLED)
+        ttk.Button(esp_bar, text='Copy', style='Ghost.TButton', command=self._copy_esp_log).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(esp_bar, text='Clear', style='Ghost.TButton', command=self._clear_esp_log).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+        self.lbl_esp_mon = ttk.Label(esp_bar, text='stopped', style='Muted.TLabel')
+        self.lbl_esp_mon.pack(side=tk.LEFT, padx=8)
+        self.txt_esp = scrolledtext.ScrolledText(esp_box, height=8, wrap=tk.WORD)
+        self._style_text(self.txt_esp)
+        self.txt_esp.grid(row=1, column=0, sticky=tk.NSEW)
+
+        log_panes.add(log_box, weight=1)
+        log_panes.add(api_box, weight=1)
+        log_panes.add(esp_box, weight=1)
 
         self.after(100, self.scan_wifi)
 
@@ -1134,21 +1412,112 @@ class LabApp(tk.Tk):
                 return "STOPPING…"
         return state
 
-    def refresh_status(self) -> None:
+    def _paint_status(self, label: ttk.Label, text: str, kind: str = "val") -> None:
+        style = {"ok": "Ok.TLabel", "bad": "Bad.TLabel", "warn": "Warn.TLabel"}.get(kind, "StatusVal.TLabel")
+        label.configure(text=text, style=style)
+
+    def _note_change(self, key: str, value: str, silent: bool) -> None:
+        prev = self._status_snapshot.get(key)
+        self._status_snapshot[key] = value
+        if silent and prev is not None and prev != value:
+            self.log(f"[{_ts()}] STATUS {key}: {prev} → {value}")
+
+    def _bridge_log_candidates(self) -> list[Path]:
+        paths = [
+            Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "PLCBridge" / "logs" / "plcbridge.log",
+            ROOT / "logs" / "plcbridge.log",
+            ROOT / "logs" / "plcbridge-lab.log",
+            ROOT / "dist" / "logs" / "plcbridge.log",
+        ]
+        seen: set[str] = set()
+        out: list[Path] = []
+        for p in paths:
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
+
+    def _tail_bridge_logs(self) -> None:
+        for path in self._bridge_log_candidates():
+            if not path.is_file():
+                continue
+            key = str(path)
+            try:
+                size = path.stat().st_size
+                first = key not in self._bridge_log_pos
+                pos = self._bridge_log_pos.get(key, max(0, size - 4096) if first else size)
+                if size < pos:
+                    pos = 0
+                if size == pos:
+                    self._bridge_log_pos[key] = size
+                    continue
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(pos)
+                    chunk = fh.read()
+                    self._bridge_log_pos[key] = fh.tell()
+                if not chunk.strip():
+                    continue
+                if first:
+                    lines = chunk.splitlines()[-12:]
+                    self.log(f"[{_ts()}] Bridge log ← {path.name}")
+                    for line in lines:
+                        self.log(line)
+                else:
+                    for line in chunk.splitlines():
+                        if line.strip():
+                            self.log(f"[bridge] {line}")
+            except OSError:
+                continue
+
+    def _live_tick(self) -> None:
+        if not self._live_busy:
+            self._live_busy = True
+            try:
+                self.refresh_status(silent=True)
+                self._tail_bridge_logs()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Live watch error: {exc}")
+            finally:
+                self._live_busy = False
+        self.after(4000, self._live_tick)
+
+    def probe_target_api(self) -> None:
+        url = self.var_api.get().strip()
+
+        def run() -> None:
+            ok, detail = probe_api_url(url)
+            msg = f"[{_ts()}] Target API probe: {detail}  ({url})"
+            self._api_log(msg)
+            self.log(msg)
+
+            def apply() -> None:
+                self._paint_status(self.lbl_api_target, detail, "ok" if ok else "bad")
+
+            self.after(0, apply)
+
+        self._worker(run)
+
+    def refresh_status(self, silent: bool = False) -> None:
         ports = list_esp_ports()
         esp = next((p for p in ports if p["is_esp"]), None)
         if esp:
-            self.lbl_esp.configure(text=f"OK — {esp['device']} ({esp['description']})")
+            esp_txt = f"OK — {esp['device']} ({esp['description']})"
+            self._paint_status(self.lbl_esp, esp_txt, "ok")
             if self.var_port.get() in {"", "auto"}:
                 self.var_port.set(esp["device"])
         else:
             other = ", ".join(p["device"] for p in ports) or "none"
-            self.lbl_esp.configure(text=f"not found (ports: {other})")
+            esp_txt = f"not found (ports: {other})"
+            self._paint_status(self.lbl_esp, esp_txt, "bad")
+        self._note_change("ESP32", esp_txt, silent)
 
         wifi = wifi_status()
-        self.lbl_wifi.configure(
-            text=f"{wifi['state']} | {wifi['ssid'] or '-'} | {wifi['signal'] or '-'}"
-        )
+        wifi_txt = f"{wifi['state']} | {wifi['ssid'] or '-'} | {wifi['signal'] or '-'}"
+        wifi_ok = "connected" in (wifi.get("state") or "").lower() or bool(wifi.get("ssid"))
+        self._paint_status(self.lbl_wifi, wifi_txt, "ok" if wifi_ok else "warn")
+        self._note_change("PC-WiFi", wifi_txt, silent)
         if wifi.get("ssid") and not self._selected_ssid():
             self.var_ssid.set(wifi["ssid"])
             self._fill_password_for_current_ssid()
@@ -1165,26 +1534,62 @@ class LabApp(tk.Tk):
                 self.var_db_user.get().strip(),
                 self.var_db_pass.get(),
             )
-            self.lbl_mysql.configure(text=f"{'OK' if ok else 'FAIL'} — {detail}")
+            mysql_txt = f"{'OK' if ok else 'FAIL'} — {detail}"
+            self._paint_status(self.lbl_mysql, mysql_txt, "ok" if ok else "bad")
         else:
-            self.lbl_mysql.configure(text="enter user/db above, then Refresh")
+            mysql_txt = "enter user/db above"
+            self._paint_status(self.lbl_mysql, mysql_txt, "warn")
+        self._note_change("MySQL", mysql_txt, silent)
 
-        self.lbl_svc.configure(text=self._service_state())
-        if ui_at_login_enabled():
-            self.lbl_ui_boot.configure(text=f"ON — {startup_shortcut_path().name}")
+        api_ok, api_detail = probe_api_url(self.var_api.get().strip())
+        self._paint_status(self.lbl_api_target, api_detail, "ok" if api_ok else "bad")
+        self._note_change("Target-API", api_detail, silent)
+
+        svc = self._service_state()
+        if "RUNNING" in svc.upper():
+            svc_kind = "ok"
+        elif "STOP" in svc.upper() or "installed" in svc.lower():
+            svc_kind = "warn"
         else:
-            self.lbl_ui_boot.configure(text="OFF")
+            svc_kind = "bad"
+        self._paint_status(self.lbl_svc, svc, svc_kind)
+        self._note_change("Service", svc, silent)
+
+        if ui_at_login_enabled():
+            boot_txt = f"ON — {startup_shortcut_path().name}"
+            self._paint_status(self.lbl_ui_boot, boot_txt, "ok")
+        else:
+            boot_txt = "OFF"
+            self._paint_status(self.lbl_ui_boot, boot_txt, "warn")
+        self._note_change("UI-login", boot_txt, silent)
+
         if self._mock_httpd is not None:
             with _API_HIT_LOCK:
                 hits = _API_HIT_COUNT
-            self.lbl_api.configure(text=f"ON :{MOCK_API_PORT} · hits={hits}")
+                last = _API_LAST_HIT or "-"
+            mock_txt = f"ON :{MOCK_API_PORT} · hits={hits} · last={last}"
+            self._paint_status(self.lbl_api, mock_txt, "ok")
         else:
-            self.lbl_api.configure(text="off — press Mock API")
-        self.log("Status refreshed.")
+            mock_txt = "off — press Mock API (lab)"
+            self._paint_status(self.lbl_api, mock_txt, "warn")
+        self._note_change("Mock-API", mock_txt, silent)
+
+        mon = "ESP serial ON" if self._esp_monitor_on else "ESP serial off"
+        self._paint_status(
+            self.lbl_live,
+            f"live 4s · {mon}",
+            "ok" if self._esp_monitor_on else "val",
+        )
+
+        if not silent:
+            self.log(f"[{_ts()}] Status refreshed (ESP/MySQL/API/Service).")
+            self._api_log(
+                f"[{_ts()}] Snapshot — Mock: {mock_txt} | Target: {api_detail} | MySQL: {mysql_txt}"
+            )
 
     def start_mock_api(self) -> None:
         if self._mock_httpd is not None:
-            self.log("Mock API already running inside this window — POSTs show in Log.")
+            self.log("Mock API already running — POSTs show in API Activity panel.")
             self.refresh_status()
             return
 
@@ -1217,7 +1622,8 @@ class LabApp(tk.Tk):
         self.var_api.set(f"http://{lan}:{MOCK_API_PORT}/api/plc-records")
         self.log(f"Mock API listening on 0.0.0.0:{MOCK_API_PORT}")
         self.log(f"ESP must POST to http://{lan}:{MOCK_API_PORT}/api/plc-records (same Wi-Fi)")
-        self.log("When ESP/Bridge sends data, the full JSON appears HERE in Log.")
+        self._api_log(f"[{_ts()}] Mock API listening — waiting for ESP POSTs on :{MOCK_API_PORT}")
+        self.log("API hits appear in the middle panel: API Activity.")
         try:
             subprocess.run(
                 [
@@ -1267,6 +1673,9 @@ class LabApp(tk.Tk):
             messagebox.showerror("Setup ESP32", "ESP32 not found on USB.")
             return
 
+        # Flash needs exclusive COM access.
+        self.stop_esp_monitor("ESP32 serial monitor stopped for flashing.")
+
         def run() -> None:
             try:
                 path = write_secrets(ssid, password, api_url, self.var_token.get().strip() or "lab-token")
@@ -1286,6 +1695,7 @@ class LabApp(tk.Tk):
                     self.log(proc.stderr[-1200:])
                 if proc.returncode == 0:
                     self.log("ESP32 ready: joins Wi-Fi and waits for Bridge serial data → posts to API.")
+                    self.log("Tip: click Start on ESP32 Serial panel to watch boot / Wi-Fi logs.")
                 else:
                     self.log(f"Setup ESP32 failed (code={proc.returncode}).")
             except Exception as exc:  # noqa: BLE001
@@ -1545,6 +1955,57 @@ backup_count = 3
         self.log("Setup UI at login disabled." if ok else f"Disable failed: {detail}")
         self.refresh_status()
 
+    def open_factory_tools(self) -> None:
+        """Launch CP2102 + PlatformIO install helper (factory Windows PCs)."""
+        candidates = [
+            ROOT / "tools" / "Install-CP2102-and-PlatformIO.ps1",
+            ROOT / "dist" / "tools" / "Install-CP2102-and-PlatformIO.ps1",
+            Path(sys.executable).resolve().parent / "tools" / "Install-CP2102-and-PlatformIO.ps1",
+        ]
+        script = next((p for p in candidates if p.is_file()), None)
+        readme = ROOT / "tools" / "README.md"
+        if not readme.is_file():
+            readme = Path(sys.executable).resolve().parent / "tools" / "README.md"
+
+        msg = (
+            "Factory PC needs:\n"
+            "  • CP2102 Silicon Labs driver (ESP → COMx)\n"
+            "  • PlatformIO (pio) to flash ESP32\n\n"
+            "Python is NOT required to run PLCBridge.exe.\n"
+            "pio is only needed for the Setup ESP32 flash step.\n\n"
+        )
+        if script:
+            msg += f"Launch installer script?\n{script}"
+            if messagebox.askyesno("CP2102 + PlatformIO", msg):
+                try:
+                    subprocess.Popen(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(script),
+                        ],
+                    )
+                    self.log(f"Opened factory tools installer: {script}")
+                except OSError as exc:
+                    self.log(f"Could not start installer: {exc}")
+                    messagebox.showerror("CP2102 + PlatformIO", str(exc))
+        else:
+            msg += (
+                "Installer script not found next to this app.\n"
+                "Copy the tools\\ folder from the USB stick, or open the Silicon Labs / PlatformIO pages from README."
+            )
+            messagebox.showinfo("CP2102 + PlatformIO", msg)
+            try:
+                webbrowser.open("https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers")
+                webbrowser.open("https://docs.platformio.org/en/latest/core/installation.html")
+            except Exception:  # noqa: BLE001
+                pass
+        if readme.is_file():
+            self.log(f"Factory tools notes: {readme}")
+
     def start_service(self) -> None:
         def run() -> None:
             self.log("Starting service (may ask for Administrator)…")
@@ -1582,6 +2043,7 @@ backup_count = 3
         self._worker(run)
 
     def destroy(self) -> None:
+        self.stop_esp_monitor()
         if self._bridge_proc and self._bridge_proc.poll() is None:
             self._bridge_proc.terminate()
         if self._mock_httpd is not None:

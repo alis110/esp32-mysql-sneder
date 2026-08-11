@@ -18,19 +18,20 @@ This project **does not guess your schema**. You must set a real SQL query in th
 
 1. [What is included](#what-is-included)
 2. [Requirements](#requirements)
-3. [Quick start with ready EXEs](#quick-start-with-ready-exes)
-4. [Setup UI (PLCBridgeSetup)](#setup-ui-plcbridgesetup)
-5. [Local lab (Docker MySQL + Mock API)](#local-lab-docker-mysql--mock-api)
-6. [Light MySQL query (low PC load)](#light-mysql-query-low-pc-load)
-7. [ESP32 firmware](#esp32-firmware)
-8. [Serial protocol](#serial-protocol)
-9. [Run from Python source](#run-from-python-source)
-10. [Build EXEs from source](#build-exes-from-source)
-11. [Windows Service](#windows-service)
-12. [Delivery guarantee and idempotency](#delivery-guarantee-and-idempotency)
-13. [Project layout](#project-layout)
-14. [Troubleshooting](#troubleshooting)
-15. [Security](#security)
+3. [Factory Windows PC — install CP2102 + PlatformIO](#factory-windows-pc--install-cp2102--platformio)
+4. [Quick start with ready EXEs](#quick-start-with-ready-exes)
+5. [Setup UI (PLCBridgeSetup)](#setup-ui-plcbridgesetup)
+6. [Local lab (Docker MySQL + Mock API)](#local-lab-docker-mysql--mock-api)
+7. [Light MySQL query (low PC load)](#light-mysql-query-low-pc-load)
+8. [ESP32 firmware](#esp32-firmware)
+9. [Serial protocol](#serial-protocol)
+10. [Run from Python source](#run-from-python-source)
+11. [Build EXEs from source](#build-exes-from-source)
+12. [Windows Service](#windows-service)
+13. [Delivery guarantee and idempotency](#delivery-guarantee-and-idempotency)
+14. [Project layout](#project-layout)
+15. [Troubleshooting](#troubleshooting)
+16. [Security](#security)
 
 ---
 
@@ -53,15 +54,108 @@ Designed for industrial PCs: **low load** — small batches, longer poll interva
 ### Hardware
 - Windows 10/11 industrial PC
 - ESP32-DevKitC (or compatible) + USB **data** cable (not charge-only)
-- CP2102 USB-UART usually appears as VID/PID `10C4:EA60`
-- **2.4 GHz** Wi-Fi (classic ESP32 has no 5 GHz)
+- USB-UART chip **CP2102** (VID/PID `10C4:EA60`) — most common on DevKit boards
+- **2.4 GHz** Wi-Fi for the ESP32 (classic ESP32 has no 5 GHz)
 
-### Software
-- Ready EXEs: Windows + CP2102 driver
-- For development / manual flash:
-  - Python 3.11+
-  - [PlatformIO](https://platformio.org/) (`pio` on PATH)
-  - Optional lab: Docker Desktop for test MySQL
+### Software on the factory Windows PC
+
+| Software | Required? | Purpose |
+|----------|-----------|---------|
+| **CP2102 / Silicon Labs VCP driver** | **Yes** | Windows must create a `COMx` port for the ESP32 |
+| **`PLCBridge.exe` + `PLCBridgeSetup.exe`** | **Yes** | Run bridge + setup UI (no Python needed for this) |
+| **PlatformIO Core (`pio`)** | **Yes if you flash on this PC** | Compiles/uploads firmware (**Setup ESP32** button) |
+| **Python 3.11+** | Only to install `pio` via pip, or to run from source | Not required to run the ready EXEs |
+| Docker | Lab only | Local test MySQL |
+
+**Important:** The Bridge EXE does **not** need Python.  
+You need **PlatformIO (`pio`)** only when flashing the ESP32 on that machine. If you flash elsewhere first, the factory PC still needs the **CP2102 driver**.
+
+Full installer helper: [`tools/Install-CP2102-and-PlatformIO.ps1`](tools/Install-CP2102-and-PlatformIO.ps1) (also under `dist/`).
+
+---
+
+## Factory Windows PC — install CP2102 + PlatformIO
+
+Copy the whole project (or at least `dist/` + `tools/` + `firmware/`) to a USB stick, then onto the factory PC.
+
+### Fast path (recommended)
+
+1. Plug the PC into the internet **once** (driver + first PlatformIO toolchain download).
+2. Run:
+
+```powershell
+cd C:\PLCBridge   # or wherever you copied the files
+Set-ExecutionPolicy -Scope Process Bypass
+.\dist\Install-CP2102-and-PlatformIO.bat
+```
+
+Or:
+
+```powershell
+.\tools\Install-CP2102-and-PlatformIO.ps1
+```
+
+3. Follow prompts:
+   - Opens **Silicon Labs CP210x** driver page if needed  
+   - Installs **PlatformIO** with pip when Python is available  
+   - Adds `pio` to User PATH when found under `%USERPROFILE%\.platformio\penv\Scripts`
+4. Open a **new** PowerShell and verify:
+
+```powershell
+pio --version
+Get-CimInstance Win32_SerialPort | Select-Object DeviceID, Name, PNPDeviceID
+```
+
+You want a port whose `PNPDeviceID` contains `VID_10C4` and `PID_EA60`.
+
+### Manual: CP2102 driver (Silicon Labs)
+
+1. Browser: [USB to UART Bridge VCP Drivers (Silicon Labs)](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)  
+2. Download **CP210x Universal Windows Driver**.  
+3. Extract the ZIP → install (run the setup or install the `.inf` as Administrator).  
+4. Connect ESP32 with a **data-capable** USB cable.  
+5. Open **Device Manager**:
+   - **Ports (COM & LPT)** → `Silicon Labs CP210x USB to UART Bridge (COMx)` = OK  
+   - Yellow bang under **Other devices** = driver not installed  
+6. Reboot if Windows still does not assign a COM port.
+
+### Manual: PlatformIO (`pio`)
+
+**A) Easiest if Python can be installed on the factory PC**
+
+1. Install [Python 3.11+ for Windows](https://www.python.org/downloads/windows/)  
+   - Enable **Add python.exe to PATH**  
+2. In PowerShell:
+
+```powershell
+py -3 -m pip install -U platformio
+pio --version
+```
+
+3. If `pio` is not found, add to User PATH:
+
+```text
+%USERPROFILE%\.platformio\penv\Scripts
+```
+
+Close and reopen the terminal, then `pio --version` again.
+
+**B) PlatformIO docs**
+
+- Core install: https://docs.platformio.org/en/latest/core/installation.html  
+- Or install VS Code + **PlatformIO IDE** extension (also provides `pio`)
+
+**First flash note:** PlatformIO downloads Espressif toolchains the first time (needs internet). Later flashes can be offline if packages are already cached under `%USERPROFILE%\.platformio\`.
+
+### After tools are installed — factory run order
+
+1. `dist\PLCBridgeSetup.exe`  
+2. MySQL settings → **Check MySQL**  
+3. Wi-Fi **2.4 GHz** + API URL → **Setup ESP32** (needs `pio` + CP2102)  
+4. **Install Service** (Administrator)  
+5. Confirm Service **Running**; use App Log / API Activity / ESP32 Serial panels to watch traffic  
+
+More notes: [`tools/README.md`](tools/README.md)
 
 ---
 
@@ -72,6 +166,7 @@ In `dist/`:
 - `PLCBridgeSetup.exe` — setup panel
 - `PLCBridge.exe` — bridge
 - `Install-Service.bat` / `Uninstall-Service.bat`
+- `Install-CP2102-and-PlatformIO.bat` — factory driver + `pio` helper
 - `Open-Setup-UI.bat` / `run-console.bat`
 
 ### Recommended factory flow
@@ -353,18 +448,16 @@ esp32-mysql-sneder/
 │   ├── platformio.ini
 │   ├── src/main.cpp
 │   └── include/secrets.example.h
-├── lab/                      # Setup UI + Docker + Mock API
-│   ├── lab_app.py
-│   ├── mock_api.py
-│   ├── docker-compose.yml
+├── tools/                    # Factory: CP2102 + PlatformIO install helpers
+│   ├── Install-CP2102-and-PlatformIO.ps1
+│   ├── Install-CP2102-and-PlatformIO.bat
 │   └── README.md
+├── lab/                      # Setup UI + Docker + Mock API
 ├── service/                  # Windows Service install/remove
 ├── tests/
-├── dist/                     # Ready EXEs + helper bats
-├── plcbridge.py              # Entry point
+├── dist/                     # Ready EXEs + bats + tools copy
+├── plcbridge.py
 ├── build.bat
-├── PLCBridge.spec
-├── PLCBridgeSetup.spec
 ├── requirements.txt
 └── README.md
 ```
@@ -387,7 +480,8 @@ Copy from `*.example*` / `config.lab.ini` for local use.
 
 | Problem | What to try |
 |---------|-------------|
-| ESP not found | Data cable, CP2102 driver, Device Manager; unplug/replug |
+| ESP not found / no COM | Install **CP2102** driver; use data USB cable; check Device Manager for `10C4:EA60` |
+| `pio` / Setup ESP32 fails | Install **PlatformIO** — run `dist\Install-CP2102-and-PlatformIO.bat` |
 | `wifi_unavailable` / ACK timeout | Use a **2.4 GHz** SSID, not 5 GHz |
 | `tcp_connect_failed` to API on PC | Private network profile + firewall allow for the API port |
 | Mock API “port in use” | Click **Mock API** again (Setup frees the port) |
