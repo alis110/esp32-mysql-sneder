@@ -410,7 +410,24 @@ def write_secrets(ssid: str, password: str, api_url: str, api_token: str) -> Pat
 
 
 def find_pio() -> str | None:
-    return shutil.which("pio") or shutil.which("platformio")
+    found = shutil.which("pio") or shutil.which("platformio")
+    if found:
+        return found
+    candidates = [
+        ROOT / "tools" / "offline" / "portable-python" / "Scripts" / "pio.exe",
+        Path(r"C:\PLCBridge\offline\portable-python\Scripts\pio.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "PLCBridge" / "offline" / "portable-python" / "Scripts" / "pio.exe",
+    ]
+    for path in candidates:
+        if path.is_file():
+            # Prefer bundled toolchains next to portable pio.
+            home = path.parents[2] / "platformio-home"
+            if not home.is_dir():
+                home = Path(r"C:\PLCBridge\offline\platformio-home")
+            if home.is_dir():
+                os.environ.setdefault("PLATFORMIO_CORE_DIR", str(home))
+            return str(path)
+    return None
 
 
 def send_test_record(port: str, baud: int, record_id: int, timeout: float = 45.0) -> tuple[bool, str]:
@@ -1205,13 +1222,14 @@ class LabApp(tk.Tk):
         for text_btn, cmd in (
             ('Refresh', self.refresh_status),
             ('Scan Wi-Fi', self.scan_wifi),
-            ('Mock API', self.start_mock_api),
             ('Check MySQL', self.refresh_status),
             ('Start', self.start_service),
             ('Stop', self.stop_service),
         ):
             btn_style = 'Danger.TButton' if text_btn == 'Stop' else 'TButton'
             ttk.Button(row1, text=text_btn, style=btn_style, command=cmd).pack(side=tk.LEFT, padx=(0, 3))
+        self.btn_mock_api = ttk.Button(row1, text='Mock API: OFF', command=self.toggle_mock_api)
+        self.btn_mock_api.pack(side=tk.LEFT, padx=(0, 3))
 
         row2 = ttk.Frame(actions, style='Card.TFrame')
         row2.pack(fill=tk.X)
@@ -1570,9 +1588,10 @@ class LabApp(tk.Tk):
             mock_txt = f"ON :{MOCK_API_PORT} · hits={hits} · last={last}"
             self._paint_status(self.lbl_api, mock_txt, "ok")
         else:
-            mock_txt = "off — press Mock API (lab)"
+            mock_txt = "OFF — click Mock API to turn on"
             self._paint_status(self.lbl_api, mock_txt, "warn")
         self._note_change("Mock-API", mock_txt, silent)
+        self._sync_mock_api_button()
 
         mon = "ESP serial ON" if self._esp_monitor_on else "ESP serial off"
         self._paint_status(
@@ -1587,10 +1606,54 @@ class LabApp(tk.Tk):
                 f"[{_ts()}] Snapshot — Mock: {mock_txt} | Target: {api_detail} | MySQL: {mysql_txt}"
             )
 
+    def _sync_mock_api_button(self) -> None:
+        if not hasattr(self, "btn_mock_api"):
+            return
+        if self._mock_httpd is not None:
+            self.btn_mock_api.configure(text="Mock API: ON", style="Accent.TButton")
+        else:
+            self.btn_mock_api.configure(text="Mock API: OFF", style="TButton")
+
+    def stop_mock_api(self) -> None:
+        if self._mock_httpd is None:
+            self.log("Mock API is already off.")
+            self._sync_mock_api_button()
+            self.refresh_status(silent=True)
+            return
+        httpd = self._mock_httpd
+        self._mock_httpd = None
+
+        def shutdown() -> None:
+            try:
+                httpd.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                httpd.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.after(0, lambda: self._after_mock_stopped())
+
+        threading.Thread(target=shutdown, daemon=True, name="mock-api-stop").start()
+        self.log(f"[{_ts()}] Stopping Mock API on :{MOCK_API_PORT}…")
+
+    def _after_mock_stopped(self) -> None:
+        self._api_log(f"[{_ts()}] Mock API stopped (:{MOCK_API_PORT})")
+        self.log(f"[{_ts()}] Mock API OFF")
+        self._sync_mock_api_button()
+        self.refresh_status(silent=True)
+
+    def toggle_mock_api(self) -> None:
+        if self._mock_httpd is not None:
+            self.stop_mock_api()
+        else:
+            self.start_mock_api()
+
     def start_mock_api(self) -> None:
         if self._mock_httpd is not None:
-            self.log("Mock API already running — POSTs show in API Activity panel.")
-            self.refresh_status()
+            self.log("Mock API already ON — POSTs show in API Activity. Click again to turn OFF.")
+            self._sync_mock_api_button()
+            self.refresh_status(silent=True)
             return
 
         # Free leftover console/old Setup listeners so this window owns the port.
@@ -1616,14 +1679,15 @@ class LabApp(tk.Tk):
                 self._mock_httpd = start_embedded_mock_api(MOCK_API_PORT)
             except OSError as exc2:
                 self.log(f"Mock API failed to bind :{MOCK_API_PORT}: {exc2}")
+                self._sync_mock_api_button()
                 return
 
         lan = local_ipv4()
         self.var_api.set(f"http://{lan}:{MOCK_API_PORT}/api/plc-records")
-        self.log(f"Mock API listening on 0.0.0.0:{MOCK_API_PORT}")
+        self.log(f"Mock API ON — listening 0.0.0.0:{MOCK_API_PORT}")
         self.log(f"ESP must POST to http://{lan}:{MOCK_API_PORT}/api/plc-records (same Wi-Fi)")
-        self._api_log(f"[{_ts()}] Mock API listening — waiting for ESP POSTs on :{MOCK_API_PORT}")
-        self.log("API hits appear in the middle panel: API Activity.")
+        self._api_log(f"[{_ts()}] Mock API ON — waiting for ESP POSTs on :{MOCK_API_PORT}")
+        self.log("Click Mock API again to turn it OFF.")
         try:
             subprocess.run(
                 [
@@ -1645,6 +1709,7 @@ class LabApp(tk.Tk):
             )
         except OSError:
             pass
+        self._sync_mock_api_button()
         self.refresh_status()
 
     def setup_esp(self) -> None:
@@ -1956,55 +2021,62 @@ backup_count = 3
         self.refresh_status()
 
     def open_factory_tools(self) -> None:
-        """Launch CP2102 + PlatformIO install helper (factory Windows PCs)."""
-        candidates = [
+        """Launch offline CP2102 + PlatformIO installer when present."""
+        offline = [
+            ROOT / "tools" / "offline" / "Install-Offline.bat",
+            Path(sys.executable).resolve().parent / "tools" / "offline" / "Install-Offline.bat",
+        ]
+        script = next((p for p in offline if p.is_file()), None)
+        online = [
             ROOT / "tools" / "Install-CP2102-and-PlatformIO.ps1",
             ROOT / "dist" / "tools" / "Install-CP2102-and-PlatformIO.ps1",
             Path(sys.executable).resolve().parent / "tools" / "Install-CP2102-and-PlatformIO.ps1",
         ]
-        script = next((p for p in candidates if p.is_file()), None)
-        readme = ROOT / "tools" / "README.md"
-        if not readme.is_file():
-            readme = Path(sys.executable).resolve().parent / "tools" / "README.md"
+        online_script = next((p for p in online if p.is_file()), None)
 
         msg = (
-            "Factory PC needs:\n"
-            "  • CP2102 Silicon Labs driver (ESP → COMx)\n"
-            "  • PlatformIO (pio) to flash ESP32\n\n"
-            "Python is NOT required to run PLCBridge.exe.\n"
-            "pio is only needed for the Setup ESP32 flash step.\n\n"
+            "Factory PC tools:\n"
+            "  • CP2102 driver (local files under tools\\offline\\cp2102)\n"
+            "  • Portable PlatformIO + ESP32 toolchains (offline pack)\n\n"
+            "Prefer OFFLINE installer (no internet).\n"
         )
         if script:
-            msg += f"Launch installer script?\n{script}"
-            if messagebox.askyesno("CP2102 + PlatformIO", msg):
+            msg += f"\nLaunch?\n{script}"
+            if messagebox.askyesno("CP2102 + PlatformIO (offline)", msg):
                 try:
-                    subprocess.Popen(
-                        [
-                            "powershell",
-                            "-NoProfile",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                            str(script),
-                        ],
-                    )
-                    self.log(f"Opened factory tools installer: {script}")
+                    subprocess.Popen(["cmd", "/c", str(script)], cwd=str(script.parent))
+                    self.log(f"Opened offline installer: {script}")
                 except OSError as exc:
-                    self.log(f"Could not start installer: {exc}")
-                    messagebox.showerror("CP2102 + PlatformIO", str(exc))
-        else:
+                    messagebox.showerror("Tools", str(exc))
+            return
+
+        if online_script:
             msg += (
-                "Installer script not found next to this app.\n"
-                "Copy the tools\\ folder from the USB stick, or open the Silicon Labs / PlatformIO pages from README."
+                "\nOffline pack not found on this USB.\n"
+                "On a PC with internet run tools\\offline\\Prepare-OfflinePack.ps1 first.\n\n"
+                f"Open online helper instead?\n{online_script}"
             )
-            messagebox.showinfo("CP2102 + PlatformIO", msg)
-            try:
-                webbrowser.open("https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers")
-                webbrowser.open("https://docs.platformio.org/en/latest/core/installation.html")
-            except Exception:  # noqa: BLE001
-                pass
-        if readme.is_file():
-            self.log(f"Factory tools notes: {readme}")
+            if messagebox.askyesno("CP2102 + PlatformIO", msg):
+                subprocess.Popen(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(online_script),
+                    ]
+                )
+            return
+
+        messagebox.showinfo(
+            "CP2102 + PlatformIO",
+            "No installer found. Copy tools\\offline from the prepared USB stick.",
+        )
+        try:
+            webbrowser.open("https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers")
+        except Exception:  # noqa: BLE001
+            pass
 
     def start_service(self) -> None:
         def run() -> None:

@@ -78,7 +78,40 @@ Full installer helper: [`tools/Install-CP2102-and-PlatformIO.ps1`](tools/Install
 
 Copy the whole project (or at least `dist/` + `tools/` + `firmware/`) to a USB stick, then onto the factory PC.
 
-### Fast path (recommended)
+### Fast path — offline USB (recommended for factory with NO internet)
+
+This repo can ship a full offline pack under `tools/offline/` (CP2102 driver + portable `pio` + ESP32 toolchains, ~1 GB+).
+
+**On the factory PC:**
+
+1. Copy the project from USB to e.g. `C:\PLCBridge\` (include the whole `tools\offline\` folder).
+2. Run:
+
+```text
+tools\offline\Install-Offline.bat
+```
+
+3. Accept driver/UAC prompts, open a **new** PowerShell, verify:
+
+```powershell
+pio --version
+Get-CimInstance Win32_SerialPort | Format-Table DeviceID, Name
+```
+
+4. Run `dist\PLCBridgeSetup.exe` → MySQL → **Setup ESP32** → **Install Service**.
+
+Details: [`tools/offline/README.md`](tools/offline/README.md)
+
+**Rebuild the offline pack** (only on a PC that HAS internet):
+
+```powershell
+cd tools\offline
+powershell -ExecutionPolicy Bypass -File .\Prepare-OfflinePack.ps1
+```
+
+Then copy the updated `tools\offline\` onto the USB stick.
+
+### Fast path (online helper, if the factory PC has internet)
 
 1. Plug the PC into the internet **once** (driver + first PlatformIO toolchain download).
 2. Run:

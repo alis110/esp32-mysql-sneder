@@ -19,6 +19,15 @@ logs/
 build/
 firmware/.pio/
 
+# Offline factory packs (large ~1GB+ toolchains; keep on USB, rebuild with Prepare-OfflinePack.ps1)
+tools/offline/portable-python/
+tools/offline/platformio-home/
+tools/offline/platformio-wheels/
+tools/offline/python-embed.zip
+tools/offline/get-pip.py
+tools/offline/*.zip
+!tools/offline/cp2102/**/*.zip
+
 # Dist runtime leftovers (keep EXEs + service scripts + bats)
 dist/data/
 dist/logs/
