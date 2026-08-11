@@ -1,13 +1,13 @@
 # Lab / Setup UI
 
-ابزار آزمایش و راه‌اندازی کنار پروژه اصلی. جزئیات معماری در [`README.md`](../README.md) ریشه است.
+Lab and setup tools that ship with the main project. Full architecture and production docs are in the root [`README.md`](../README.md).
 
-## اجرا
+## Run
 
 ```powershell
-# از ریشه پروژه
+# From repo root
 .\lab\run_lab.bat
-# یا بعد از بیلد:
+# Or after build:
 .\dist\PLCBridgeSetup.exe
 ```
 
@@ -21,36 +21,36 @@ docker compose up -d
 - Host: `127.0.0.1`
 - Port: `3307`
 - DB / user / pass: `plcbridge_lab` / `bridge` / `bridge`
-- جدول نمونه: `lab_events` (از `init.sql`)
+- Sample table: `lab_events` (from `init.sql`)
 
 ## Mock API
 
-در Setup دکمه **Mock API** را بزنید (پورت `8089`). اگر پورت اشغال باشد خودش آزاد می‌شود و POSTهای ESP در Log همان پنجره دیده می‌شوند.
+In Setup, click **Mock API** (port `8089`). If the port is busy, Setup frees it and ESP POSTs appear in the same window Log.
 
-فایروال (اختیاری):
+Optional firewall helper:
 
 ```powershell
 .\lab\open_firewall_8089.ps1
 ```
 
-شبکه ویندوز را **Private** کنید تا ESP به IP لپ‌تاپ برسد.
+Set the Windows network profile to **Private** so the ESP can reach the PC LAN IP.
 
-## ترتیب تست E2E
+## End-to-end test order
 
-1. Docker MySQL بالا
+1. Start Docker MySQL
 2. Setup → Check MySQL
-3. Scan Wi-Fi (2.4GHz) + Mock API
+3. Scan Wi-Fi (2.4 GHz) + Mock API
 4. Setup ESP32
 5. Install / Start Service
-6. در Log باید hitهای API دیده شود
+6. API hits should appear in the Log
 
-## فایل‌های کمکی
+## Helper files
 
-| فایل | کار |
-|------|-----|
-| `lab_app.py` | سورس Setup UI |
-| `mock_api.py` | Mock API کنسولی جدا (اختیاری؛ ترجیح با دکمه داخل UI) |
-| `build_setup.bat` | بیلد `PLCBridgeSetup.exe` |
-| `finish_local_lab.bat` | اسکریپت جمع‌بندی تست lab |
-| `diag_serial.py` | تشخیص سریال |
-| `docker-compose.yml` + `init.sql` | MySQL lab |
+| File | Purpose |
+|------|---------|
+| `lab_app.py` | Setup UI source |
+| `mock_api.py` | Standalone console Mock API (optional; prefer the in-UI button) |
+| `build_setup.bat` | Build `PLCBridgeSetup.exe` |
+| `finish_local_lab.bat` | Lab finish helper |
+| `diag_serial.py` | Serial diagnostics |
+| `docker-compose.yml` + `init.sql` | Lab MySQL |

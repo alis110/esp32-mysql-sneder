@@ -1,90 +1,90 @@
 # ESP32 MySQL Sender (PLCBridge)
 
-ارسال امن و سبک رکوردهای MySQL از کامپیوتر صنعتی ویندوز به REST API، از مسیر:
+A light, durable bridge that reads rows from a local Windows MySQL database and delivers them to a REST API through:
 
 ```text
 MySQL  →  Python Bridge (Windows Service)  →  USB Serial  →  ESP32  →  Wi-Fi  →  HTTPS/HTTP API
 ```
 
-ریپوی گیت‌هاب: [alis110/esp32-mysql-sneder](https://github.com/alis110/esp32-mysql-sneder)
+GitHub: [alis110/esp32-mysql-sneder](https://github.com/alis110/esp32-mysql-sneder)
 
-این پروژه **schema را حدس نمی‌زند**. باید خودتان Query واقعی را در config بگذارید. تا وقتی `enabled=true` و Query درست نباشد، داده‌ای خوانده/فرستاده نمی‌شود.
+This project **does not guess your schema**. You must set a real SQL query in the config. No data is read or sent until `enabled=true` and a valid query are configured.
 
 ---
 
-## فهرست
+## Contents
 
-1. [چی ساخته شده؟](#چی-ساخته-شده)
-2. [پیش‌نیازها](#پیشنیازها)
-3. [شروع سریع با EXE آماده](#شروع-سریع-با-exe-آماده)
-4. [پنل Setup (PLCBridgeSetup)](#پنل-setup-plcbridgesetup)
-5. [آزمایشگاه محلی (Docker MySQL + Mock API)](#آزمایشگاه-محلی-docker-mysql--mock-api)
-6. [تنظیم Query سبک و بی‌فشار](#تنظیم-query-سبک-و-بیفشار)
-7. [Firmware ESP32](#firmware-esp32)
-8. [پروتکل Serial](#پروتکل-serial)
-9. [اجرای کنسول از سورس Python](#اجرای-کنسول-از-سورس-python)
-10. [بیلد EXE از سورس](#بیلد-exe-از-سورس)
+1. [What is included](#what-is-included)
+2. [Requirements](#requirements)
+3. [Quick start with ready EXEs](#quick-start-with-ready-exes)
+4. [Setup UI (PLCBridgeSetup)](#setup-ui-plcbridgesetup)
+5. [Local lab (Docker MySQL + Mock API)](#local-lab-docker-mysql--mock-api)
+6. [Light MySQL query (low PC load)](#light-mysql-query-low-pc-load)
+7. [ESP32 firmware](#esp32-firmware)
+8. [Serial protocol](#serial-protocol)
+9. [Run from Python source](#run-from-python-source)
+10. [Build EXEs from source](#build-exes-from-source)
 11. [Windows Service](#windows-service)
-12. [تضمین تحویل و Idempotency](#تضمین-تحویل-و-idempotency)
-13. [ساختار پروژه](#ساختار-پروژه)
-14. [عیب‌یابی](#عیبیابی)
-15. [امنیت](#امنیت)
+12. [Delivery guarantee and idempotency](#delivery-guarantee-and-idempotency)
+13. [Project layout](#project-layout)
+14. [Troubleshooting](#troubleshooting)
+15. [Security](#security)
 
 ---
 
-## چی ساخته شده؟
+## What is included
 
-| قطعه | نقش |
-|------|-----|
-| **PLCBridge.exe** | Bridge: MySQL می‌خواند، به ESP روی USB می‌فرستد، بعد از ACK وضعیت را در SQLite نگه می‌دارد |
-| **PLCBridgeSetup.exe** | UI راه‌اندازی: Wi-Fi، MySQL، Mock API، فلش ESP، نصب Service |
-| **firmware/** | کد ESP32 (PlatformIO): از Serial می‌گیرد، با Wi-Fi به API پست می‌کند، ACK/NACK برمی‌گرداند |
-| **service/** | نصب/حذف سرویس ویندوز با auto-start و restart بعد از crash |
-| **lab/** | Docker MySQL، Mock API، اسکریپت‌های تست |
+| Component | Role |
+|-----------|------|
+| **PLCBridge.exe** | Bridge: reads MySQL, sends records to ESP over USB, commits progress in SQLite only after ACK |
+| **PLCBridgeSetup.exe** | Setup UI: Wi-Fi, MySQL, Mock API, ESP flash, service install |
+| **firmware/** | ESP32 PlatformIO app: receives JSON on Serial, POSTs to API over Wi-Fi, returns ACK/NACK |
+| **service/** | Install/remove Windows Service (auto-start + crash recovery) |
+| **lab/** | Docker MySQL, Mock API, lab helpers |
 
-طراحی برای PC کارخانه: **کم‌مصرف** — batch کوچک، poll با فاصله، فقط ردیف‌های جدید با `id > last_id`.
+Designed for industrial PCs: **low load** — small batches, longer poll interval, only new rows via `id > last_id`.
 
 ---
 
-## پیش‌نیازها
+## Requirements
 
-### سخت‌افزار
-- ویندوز ۱۰/۱۱ روی PC صنعتی
-- ESP32-DevKitC (یا معادل) + کابل USB **data** (نه فقط شارژ)
-- مبدل CP2102 معمولاً با VID/PID `10C4:EA60` دیده می‌شود
-- Wi-Fi **2.4GHz** (ESP32 معمولی 5GHz ندارد)
+### Hardware
+- Windows 10/11 industrial PC
+- ESP32-DevKitC (or compatible) + USB **data** cable (not charge-only)
+- CP2102 USB-UART usually appears as VID/PID `10C4:EA60`
+- **2.4 GHz** Wi-Fi (classic ESP32 has no 5 GHz)
 
-### نرم‌افزار
-- برای EXE آماده: فقط ویندوز + درایور CP2102
-- برای توسعه/فلش دستی:
+### Software
+- Ready EXEs: Windows + CP2102 driver
+- For development / manual flash:
   - Python 3.11+
-  - [PlatformIO](https://platformio.org/) (`pio` در PATH)
-  - (اختیاری lab) Docker Desktop برای MySQL آزمایشی
+  - [PlatformIO](https://platformio.org/) (`pio` on PATH)
+  - Optional lab: Docker Desktop for test MySQL
 
 ---
 
-## شروع سریع با EXE آماده
+## Quick start with ready EXEs
 
-در پوشه `dist/` این‌ها آماده است:
+In `dist/`:
 
-- `PLCBridgeSetup.exe` — پنل راه‌اندازی
-- `PLCBridge.exe` — Bridge
+- `PLCBridgeSetup.exe` — setup panel
+- `PLCBridge.exe` — bridge
 - `Install-Service.bat` / `Uninstall-Service.bat`
 - `Open-Setup-UI.bat` / `run-console.bat`
 
-### ترتیب پیشنهادی (کارخانه)
+### Recommended factory flow
 
-1. `PLCBridgeSetup.exe` را اجرا کنید.
-2. تنظیمات MySQL را پر کنید → **Check MySQL**.
-3. Wi-Fi 2.4GHz را **Scan** کنید، رمز را تأیید کنید، **API URL** و Token را بگذارید.
-4. ESP را به USB وصل کنید → **Setup ESP32** (secrets + فلش).
-5. **Install Service** (UAC / Administrator) — یک‌بار کافی است.
-6. سرویس از boot بالا می‌آید حتی بدون login کاربر.
+1. Run `PLCBridgeSetup.exe`.
+2. Fill MySQL settings → **Check MySQL**.
+3. **Scan** 2.4 GHz Wi-Fi, confirm password, set **API URL** and token.
+4. Plug ESP over USB → **Setup ESP32** (writes secrets + flashes).
+5. **Install Service** once (UAC / Administrator).
+6. Service starts at boot even if no user is logged in.
 
-مسیرهای runtime بعد از نصب Service:
+Runtime paths after service install:
 
-| چیز | مسیر |
-|-----|------|
+| Item | Path |
+|------|------|
 | EXE | `C:\Program Files\PLCBridge\PLCBridge.exe` |
 | Config | `C:\ProgramData\PLCBridge\config\config.ini` |
 | State | `C:\ProgramData\PLCBridge\data\state.sqlite3` |
@@ -92,59 +92,59 @@ MySQL  →  Python Bridge (Windows Service)  →  USB Serial  →  ESP32  →  W
 
 ---
 
-## پنل Setup (PLCBridgeSetup)
+## Setup UI (PLCBridgeSetup)
 
 ```powershell
 .\dist\PLCBridgeSetup.exe
-# یا از سورس:
+# or from source:
 .\lab\run_lab.bat
 ```
 
-| دکمه | کار |
-|------|-----|
-| **Refresh / Check MySQL** | وضعیت ESP، Wi-Fi، MySQL، Mock API، Service |
-| **Scan Wi-Fi** | لیست SSID + پر کردن رمز ذخیره‌شده ویندوز (در صورت وجود) |
-| **Mock API** | API آزمایشی روی پورت `8089` داخل همین پنجره؛ اگر پورت اشغال باشد خودش آزاد می‌کند |
-| **Setup ESP32** | نوشتن `secrets.h` + فلش با PlatformIO |
-| **Install / Uninstall Service** | نصب سرویس auto-start (نیاز به Admin) |
-| **Start / Stop** | کنترل سرویس |
-| **UI at login** | شورتکات Startup برای باز شدن Setup بعد از login |
-| **Copy / Clear** | مدیریت Log داخل UI |
+| Button | Action |
+|--------|--------|
+| **Refresh / Check MySQL** | Status for ESP, Wi-Fi, MySQL, Mock API, Service |
+| **Scan Wi-Fi** | List SSIDs; fill saved Windows profile password when available |
+| **Mock API** | Lab API on port `8089` inside this window; frees the port if another process holds it |
+| **Setup ESP32** | Write `secrets.h` + PlatformIO upload |
+| **Install / Uninstall Service** | Auto-start service (Admin required) |
+| **Start / Stop** | Control installed service |
+| **UI at login** | Startup shortcut so Setup opens after user login |
+| **Copy / Clear** | Log clipboard / clear |
 
-**نکته شبکه:** پروفایل Wi-Fi ویندوز را **Private** کنید و فایروال پورت API (مثلاً `8089` برای lab) را باز بگذارید تا ESP بتواند به PC برسد.
+**Network tip:** set the Windows Wi-Fi profile to **Private** and allow the API port in the firewall (e.g. `8089` for lab) so the ESP can reach the PC.
 
-جزئیات بیشتر: [`lab/README.md`](lab/README.md)
+More lab notes: [`lab/README.md`](lab/README.md)
 
 ---
 
-## آزمایشگاه محلی (Docker MySQL + Mock API)
+## Local lab (Docker MySQL + Mock API)
 
-برای تست بدون دیتابیس کارخانه:
+Test without the factory database:
 
 ```powershell
 cd lab
 docker compose up -d
-# در Setup: MySQL host=127.0.0.1 port=3307 db=plcbridge_lab user/pass=bridge
-# دکمه Mock API → سپس Setup ESP32 با API:
-#   http://<LAN-IP-PC>:8089/api/plc-records
+# In Setup: host=127.0.0.1 port=3307 db=plcbridge_lab user/pass=bridge
+# Click Mock API, then Setup ESP32 with:
+#   http://<PC-LAN-IP>:8089/api/plc-records
 ```
 
-فایل نمونه lab: [`config/config.lab.ini`](config/config.lab.ini)
+Lab sample config: [`config/config.lab.ini`](config/config.lab.ini)
 
-جریان E2E موفق یعنی:
-1. Bridge رکوردهای `lab_events` را می‌خواند
-2. روی COM به ESP می‌فرستد
-3. ESP با Wi-Fi به Mock API پست می‌کند
-4. ACK برمی‌گردد و `last_success_id` جلو می‌رود
-5. JSON در Log پنل Setup دیده می‌شود
+A successful end-to-end run means:
+1. Bridge reads `lab_events`
+2. Sends rows to ESP on COM
+3. ESP POSTs to Mock API over Wi-Fi
+4. ACK returns and `last_success_id` advances
+5. JSON hits appear in the Setup Log
 
 ---
 
-## تنظیم Query سبک و بی‌فشار
+## Light MySQL query (low PC load)
 
-هرگز `SELECT *` روی جدول بزرگ نزنید. فقط ستون‌های لازم + فقط IDهای جدید + LIMIT کوچک.
+Never run `SELECT *` on a large table. Select only needed columns, only new IDs, with a small `LIMIT`.
 
-نمونه (lab):
+Lab example:
 
 ```sql
 SELECT id, temperature, note, created_at
@@ -154,26 +154,26 @@ ORDER BY id ASC
 LIMIT %(batch_size)s
 ```
 
-قرارداد اجباری:
+Required contract:
 
-- ستون `id_column` (پیش‌فرض `id`) عددی، یکتا، **همواره افزایشی** باشد
-- شرط `> %(last_id)s` و `ORDER BY ... ASC`
-- ترجیحاً ایندکس روی همان ستون ID
-- `%(batch_size)s` را استفاده کنید
+- `id_column` (default `id`) must be numeric, unique, and **strictly increasing**
+- Query must use `> %(last_id)s` and `ORDER BY ... ASC`
+- Prefer an index on that ID column
+- Use `%(batch_size)s`
 
-پیش‌فرض‌های سبک این پروژه:
+Light defaults used by this project:
 
-| پارامتر | مقدار پیشنهادی | معنی |
-|---------|----------------|------|
-| `batch_size` | `5` | حداکثر ۵ رکورد در هر دور |
-| `poll_interval_seconds` | `10` | هر ۱۰ ثانیه یکبار نگاه به MySQL |
-| `retry_delay_seconds` | `15` | تأخیر بعد از خطا |
-| `connect_timeout_seconds` | `5` | تایم‌اوت اتصال |
+| Setting | Suggested | Meaning |
+|---------|-----------|---------|
+| `batch_size` | `5` | At most 5 rows per poll |
+| `poll_interval_seconds` | `10` | Poll MySQL every 10 seconds |
+| `retry_delay_seconds` | `15` | Delay after errors |
+| `connect_timeout_seconds` | `5` | Connect timeout |
 
-فایل نمونه: [`config/config.example.ini`](config/config.example.ini)  
-کپی کنید به `config/config.ini` (این فایل واقعی در git نیست).
+Template: [`config/config.example.ini`](config/config.example.ini)  
+Copy to `config/config.ini` (real config is gitignored).
 
-قبل از تولید، schema را ببینید:
+Before production, inspect schema with a read-only user:
 
 ```sql
 SHOW TABLES;
@@ -181,24 +181,24 @@ DESCRIBE your_table;
 SHOW INDEX FROM your_table;
 ```
 
-کاربر MySQL فقط با دسترسی **SELECT** روی همان جدول بسازید.
+Create a MySQL account with **SELECT-only** rights on that table.
 
 ---
 
-## Firmware ESP32
+## ESP32 firmware
 
-1. PlatformIO نصب باشد.
-2. `firmware/include/secrets.example.h` را به `secrets.h` کپی کنید و پر کنید:
+1. Install PlatformIO.
+2. Copy `firmware/include/secrets.example.h` → `secrets.h` and fill:
 
 ```cpp
 #define WIFI_SSID "Your-2.4GHz-SSID"
 #define WIFI_PASSWORD "..."
 #define API_URL "https://your.api/endpoint"
 #define API_TOKEN "..."
-#define ALLOW_INSECURE_TLS false   // lab: true فقط برای HTTP/تست
+#define ALLOW_INSECURE_TLS false   // lab only: true for HTTP / quick tests
 ```
 
-3. فلش:
+3. Flash:
 
 ```powershell
 cd firmware
@@ -206,23 +206,23 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
-یا از Setup: دکمه **Setup ESP32**.
+Or use Setup → **Setup ESP32**.
 
-رفتار firmware:
-- خط JSON تا ۱۶ KiB
-- reconnect Wi-Fi
+Firmware behavior:
+- JSON lines up to 16 KiB
+- Wi-Fi reconnect
 - HTTP timeout / retry
-- watchdog ~۶۰s
-- فقط HTTP 2xx → ACK
-- 4xx (به‌جز 408/429) معمولاً retry داخلی ندارد؛ Bridge بعداً دوباره می‌فرستد
+- ~60s watchdog
+- HTTP 2xx → ACK
+- Most 4xx (except 408/429) are not retried internally; the Bridge retries later
 
-TLS: در lab با `ALLOW_INSECURE_TLS true` (یا HTTP) کار می‌کند. برای production، CA را در `ROOT_CA` بگذارید و insecure را خاموش کنید.
+TLS: lab can use `ALLOW_INSECURE_TLS true` or plain HTTP. For production, embed the issuing CA in `ROOT_CA` and keep insecure mode off.
 
 ---
 
-## پروتکل Serial
+## Serial protocol
 
-هر پیام یک خط JSON UTF-8 + `\n`:
+One UTF-8 JSON object per line + `\n`:
 
 ```json
 {"type":"data","id":15230,"idempotency_key":"plc-record-15230","payload":{"temperature":73.4}}
@@ -230,22 +230,22 @@ TLS: در lab با `ALLOW_INSECURE_TLS true` (یا HTTP) کار می‌کند. �
 {"type":"nack","id":15230,"error":"wifi_unavailable"}
 ```
 
-Bridge فقط بعد از `ack` هم‌ID، مقدار `last_success_id` را در SQLite با تراکنش durable ذخیره می‌کند. اگر MySQL/COM/ESP/Wi-Fi/API قطع شود، **همان ID** دوباره تلاش می‌شود؛ رکورد بعدی جلو نمی‌افتد.
+The Bridge updates `last_success_id` in SQLite with a durable transaction only after a matching `ack`. If MySQL, COM, ESP, Wi-Fi, or the API fails, the **same ID** is retried; later IDs do not jump ahead.
 
 ---
 
-## اجرای کنسول از سورس Python
+## Run from Python source
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item config\config.example.ini config\config.ini
-# config.ini را ویرایش کنید: enabled=true + query واقعی
+# Edit config.ini: enabled=true + real query
 python plcbridge.py --config config\config.ini
 ```
 
-پورت سریال:
+Serial settings:
 
 ```ini
 [serial]
@@ -253,15 +253,15 @@ port = auto
 vid_pid = 10C4:EA60
 ```
 
-یا صریح: `port = COM7`
+Or pin a port: `port = COM7`
 
-لیست پورت‌ها:
+List ports:
 
 ```powershell
 Get-CimInstance Win32_SerialPort | Select-Object DeviceID, Name, PNPDeviceID
 ```
 
-تست واحد:
+Unit tests:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -269,53 +269,53 @@ python -m unittest discover -s tests -v
 
 ---
 
-## بیلد EXE از سورس
+## Build EXEs from source
 
 ```powershell
 .\build.bat
 ```
 
-خروجی در `dist/`:
+Outputs under `dist/`:
 - `PLCBridge.exe`
-- کپی اسکریپت‌های service و فایل‌های کمکی
+- service scripts and helper bats
 
-بیلد جداگانه Setup UI:
+Build Setup UI separately:
 
 ```powershell
 .\lab\build_setup.bat
 ```
 
-فایل‌های PyInstaller: `PLCBridge.spec` و `PLCBridgeSetup.spec` (داخل ریپو هستند).
+PyInstaller specs in repo: `PLCBridge.spec`, `PLCBridgeSetup.spec`.
 
 ---
 
 ## Windows Service
 
-از Setup (دکمه Install) یا:
+From Setup (**Install Service**) or:
 
 ```powershell
 # Administrator
 Set-ExecutionPolicy -Scope Process Bypass
 .\dist\Install-Service.bat
-# یا:
+# or:
 .\service\install-service.ps1
 ```
 
-سرویس:
-- نام: `PLCBridge`
+Service details:
+- Name: `PLCBridge`
 - Startup: Automatic (delayed)
-- Recovery: restart بعد از crash
-- حساب پیش‌فرض: `LocalSystem`
+- Recovery: restart after crash
+- Default account: `LocalSystem`
 
-حذف:
+Remove:
 
 ```powershell
 .\dist\Uninstall-Service.bat
 ```
 
-Config / state / log عمداً در `ProgramData` می‌مانند تا داده نقطه ادامه پاک نشود.
+Config / state / logs intentionally remain under `ProgramData` so the resume point is not wiped.
 
-کنسول روی EXE نصب‌شده:
+Console mode on the installed EXE:
 
 ```powershell
 & "C:\Program Files\PLCBridge\PLCBridge.exe" --console --config "C:\ProgramData\PLCBridge\config\config.ini"
@@ -323,31 +323,31 @@ Config / state / log عمداً در `ProgramData` می‌مانند تا داد
 
 ---
 
-## تضمین تحویل و Idempotency
+## Delivery guarantee and idempotency
 
-مدل: **at-least-once**.
+Delivery model: **at-least-once**.
 
-اگر API رکورد را قبول کند ولی ACK به Bridge نرسد، همان پیام دوباره می‌رود. برای جلوگیری از duplicate، API باید هدر:
+If the API accepts a record but the ACK never reaches the Bridge, the same message is sent again. To avoid duplicates, the API must treat:
 
 ```http
 Idempotency-Key: plc-record-15230
 ```
 
-را unique نگه دارد و درخواست تکراری را با 2xx بدون ساخت رکورد جدید جواب دهد.
+as unique and answer repeated requests with 2xx without creating a second row.
 
-بدون همکاری API، هم‌زمان «هیچ رکوردی گم نشود» و «هرگز duplicate نشود» در سیستم توزیع‌شده تضمین قطعی ندارد.
+Without API-side idempotency, you cannot simultaneously guarantee “never lost” and “never duplicated” in a distributed system.
 
 ---
 
-## ساختار پروژه
+## Project layout
 
 ```text
 esp32-mysql-sneder/
-├── app/                      # Bridge Python (MySQL, serial, state, service)
+├── app/                      # Python bridge (MySQL, serial, state, service)
 ├── config/
-│   ├── config.example.ini    # قالب تولید
-│   └── config.lab.ini        # قالب lab (Docker)
-├── firmware/                 # PlatformIO ESP32
+│   ├── config.example.ini    # Production template
+│   └── config.lab.ini        # Lab template (Docker)
+├── firmware/                 # PlatformIO ESP32 project
 │   ├── platformio.ini
 │   ├── src/main.cpp
 │   └── include/secrets.example.h
@@ -356,9 +356,9 @@ esp32-mysql-sneder/
 │   ├── mock_api.py
 │   ├── docker-compose.yml
 │   └── README.md
-├── service/                  # نصب/حذف Windows Service
+├── service/                  # Windows Service install/remove
 ├── tests/
-├── dist/                     # EXEهای آماده + batها
+├── dist/                     # Ready EXEs + helper bats
 ├── plcbridge.py              # Entry point
 ├── build.bat
 ├── PLCBridge.spec
@@ -367,44 +367,43 @@ esp32-mysql-sneder/
 └── README.md
 ```
 
-### چیزهایی که عمداً در Git نیستند
+### Intentionally not in Git
 
-| فایل | دلیل |
-|------|------|
-| `config/config.ini` | رمز MySQL واقعی |
-| `firmware/include/secrets.h` | Wi-Fi / Token واقعی |
-| `.venv/` | محیط مجازی محلی |
-| `build/` ، `firmware/.pio/` | خروجی بیلد |
-| `data/*.sqlite3` ، `logs/` | state و لاگ runtime |
+| Path | Reason |
+|------|--------|
+| `config/config.ini` | Real MySQL credentials |
+| `firmware/include/secrets.h` | Real Wi-Fi / API token |
+| `.venv/` | Local virtualenv |
+| `build/`, `firmware/.pio/` | Build artifacts |
+| `data/*.sqlite3`, `logs/` | Runtime state and logs |
 
-برای استفاده: از `*.example*` / `config.lab.ini` کپی بگیرید.
-
----
-
-## عیب‌یابی
-
-| مشکل | کار |
-|------|-----|
-| ESP پیدا نمی‌شود | کابل data، درایور CP2102، Device Manager؛ گاهی unplug/replug |
-| `wifi_unavailable` / ACK timeout | SSID باید 2.4GHz باشد نه 5G |
-| `tcp_connect_failed` به API روی PC | شبکه Private + فایروال پورت API |
-| Mock API «port in use» | در Setup دوباره **Mock API** بزنید (پورت را آزاد می‌کند) |
-| Service error 1063 با دبل‌کلیک EXE | عادی است؛ سرویس از SCM استارت می‌شود یا `--console` بزنید |
-| MySQL fail | host/port/user و `enabled=true` را چک کنید؛ lab معمولاً پورت `3307` است |
-| داده نمی‌رود | Query باید `%(last_id)s` داشته باشد؛ Log سرویس را ببینید |
+Copy from `*.example*` / `config.lab.ini` for local use.
 
 ---
 
-## امنیت
+## Troubleshooting
 
-- رمزها را در Git نگذارید (`secrets.h` و `config.ini` ignore شده‌اند).
-- کاربر MySQL فقط `SELECT`.
-- در production: HTTPS + CA واقعی، `ALLOW_INSECURE_TLS=false`.
-- Token API را در log عمومی چاپ نکنید.
-- Token / payload را روی سرویس‌های request-bin عمومی واقعی نگذارید.
+| Problem | What to try |
+|---------|-------------|
+| ESP not found | Data cable, CP2102 driver, Device Manager; unplug/replug |
+| `wifi_unavailable` / ACK timeout | Use a **2.4 GHz** SSID, not 5 GHz |
+| `tcp_connect_failed` to API on PC | Private network profile + firewall allow for the API port |
+| Mock API “port in use” | Click **Mock API** again (Setup frees the port) |
+| Service / error 1063 on double-click EXE | Expected for SCM services; start via Service or `--console` |
+| MySQL fail | Check host/port/user and `enabled=true`; lab usually uses port `3307` |
+| No data flowing | Query must include `%(last_id)s`; check service log |
 
 ---
 
-## لایسنس / استفاده
+## Security
 
-برای استقرار کارخانه و آزمایشگاه محلی آماده شده است. قبل از اتصال به MySQL تولید، Query و ایندکس را روی کپی/کاربر read-only تست کنید.
+- Do not commit real secrets (`secrets.h` and `config.ini` are gitignored).
+- Use a MySQL user with **SELECT** only.
+- In production: HTTPS + real CA, `ALLOW_INSECURE_TLS=false`.
+- Do not log API tokens or dump payloads to public request-bin services with real credentials.
+
+---
+
+## Usage note
+
+Ready for factory deployment and local lab testing. Always validate the query and indexes with a read-only account before pointing at production MySQL.
