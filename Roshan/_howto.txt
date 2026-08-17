@@ -1,0 +1,49 @@
+Building a Production Report from the ROSHAN WinCC Archives
+Siemens WinCC Tag Logging (SQL Server) — unit PWC10 flow metering
+1.  What the data is
+The folder holds nine Siemens WinCC "Tag Logging" archive databases (SQL Server .mdf/.ldf) from project ROSHAN on PC CPUPC01. They record process FLOWRATES for eleven measuring points on unit PWC10 — a set of inflow (feed) meters and outflow (product) meters.
+Two key facts shape everything below:
+Actual measurements live ONLY in the two "Fast" databases — 32,097 archived value-blocks spanning 20-Dec-2023 to 19-Jun-2026. The seven "Slow" segment files contain the tag configuration but zero values.
+The numbers themselves are stored compressed in a binary column (TagCompressed.BinValues). You cannot read them with a plain SQL SELECT — WinCC's decompression layer is required. This is the single biggest thing to plan around.
+2.  The eleven tags, grouped for production
+<w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:type="auto" w:w="0"/><w:jc w:val="center"/><w:tblLook w:firstColumn="1" w:firstRow="1" w:lastColumn="0" w:lastRow="0" w:noHBand="0" w:noVBand="1" w:val="04A0"/></w:tblPr><w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="1F4E78"/></w:tcPr><w:p><w:r/><w:r><w:rPr><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="21"/></w:rPr><w:t>Stream
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="1F4E78"/></w:tcPr><w:p><w:r/><w:r><w:rPr><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="21"/></w:rPr><w:t>Meters (ValueID)
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="1F4E78"/></w:tcPr><w:p><w:r/><w:r><w:rPr><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="21"/></w:rPr><w:t>Role in the report
+<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="E2EFDA"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Inflow / feed
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>A_4001 (1), A_4053 (2), A_4047 (4), A_4049 (5), A_4051 (6)
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Total feed volume IN
+<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="FCE4D6"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Outflow / product
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>A_4002 (7), B_4002 (8), B_4005 (9), B_4008 (10), B_4011 (11), B_4000 (12)
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Total product volume OUT
+<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="2880"/><w:shd w:val="clear" w:fill="FFF2CC"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Yield / balance
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Outflow ÷ Inflow
+<w:tcPr><w:tcW w:type="dxa" w:w="2880"/></w:tcPr><w:p><w:r><w:rPr><w:sz w:val="20"/></w:rPr><w:t>Process yield %, losses, mass balance
+ 
+Because the system measures both what goes in and what comes out, you can report throughput AND a yield/mass-balance (out ÷ in) — usually the most valuable number on a production report.
+3.  The core method: flow → volume
+A flowrate (e.g. m³/h) becomes production by integrating over time:
+     Volume over a period  ≈  Σ ( flowrate × sample interval )
+Do this per meter, per shift or per day. Sum the inflow meters for total feed, sum the outflow meters for total product, and divide for yield. WinCC's own aggregation can also return a time-weighted total directly, so you don't have to integrate by hand.
+4.  Three ways to get the (decompressed) values
+Pick whichever matches what you have access to. All three end with the same data: ValueID + timestamp + flowrate, which you then aggregate.
+Option A — WinCC Information Server / DataMonitor / Excel report add-in  (recommended)
+These Siemens reporting tools read the archive natively (decompression handled for you) and are built to produce shift/daily production and trend reports. Point a report at the ProcessValueArchive tags, choose a time-weighted total, group by shift. Least effort, correct results.
+Option B — WinCC OLE-DB Provider + Excel / SQL Server Reporting Services
+Install the WinCC Connectivity Pack. Query the archive through "WinCCOLEDBProvider.1" — it decompresses TagCompressed into rows. Example query shape:
+SELECT * FROM TagLogging WHERE Timestamp &gt; '2026-06-01' AND ValueID IN (1,2,4,5,6,...) ORDER BY ValueID, Timestamp
+Then SUM / integrate in Excel or SSRS. Good when you want a custom report layout.
+Option C — Re-attach these .mdf files to SQL Server
+Attaching works for inspecting the schema and the block index, but TagCompressed.BinValues is still compressed — a direct SELECT returns binary, not flow values. To use raw SQL going forward, configure WinCC to also write TagUncompressed (uncompressed) so values land in readable columns (ValueID, TimeStamp, RealValue, Quality).
+5.  Suggested report layout
+One row per shift (or per day), for the period you choose:
+Date  |  Shift  |  Feed total (m³)  |  Product total (m³)  |  Yield %  |  Avg flow  |  Max flow  |  Downtime (min)
+ 
+Feed / product totals: integrate the grouped meters (section 2).
+Yield %: product total ÷ feed total.
+Downtime: intervals with zero or missing flow.
+Add trend charts per meter and a running monthly total.
+6.  What I can do next
+Build this report automatically once you can export decompressed values (Option A or B) — just drop the export (CSV/Excel) into this folder.
+If you enable TagUncompressed logging, I can parse the values straight from the .mdf and generate the full production report here.
+Right now, the attached workbook already gives you the complete tag list, the in/out grouping, and the archive block index (which meter logged over which interval).
+Note: the raw flow values are not present in this document because they are stored in WinCC’s proprietary compressed format and require WinCC tooling to decode.

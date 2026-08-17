@@ -21,7 +21,7 @@ Built for air-gapped Windows factory PCs. Run `Install-Offline.bat` on site.
 1. Copy **entire** project USB → e.g. `C:\PLCBridge\` (must include `tools\offline\` fully, ~1.3 GB).
 2. Run `tools\offline\Install-Offline.bat`
 3. New PowerShell: `pio --version`
-4. `dist\PLCBridgeSetup.exe` → Check MySQL → Setup ESP32 → Install Service
+4. `dist\PLCBridgeSetup.exe` → WinCC factory → Check DB → Setup ESP32 → Install Service
 
 Optional without compile: `Upload-Prebuilt-Firmware.bat COM7`
 

@@ -17,12 +17,13 @@ if errorlevel 1 exit /b 1
 
 REM Setup UI (windowed)
 pyinstaller --noconfirm --onefile --windowed --name PLCBridgeSetup ^
-  --hidden-import serial --hidden-import serial.tools.list_ports --hidden-import mysql.connector ^
+  --hidden-import serial --hidden-import serial.tools.list_ports --hidden-import pyodbc ^
   lab\lab_app.py
 if errorlevel 1 exit /b 1
 
 if not exist "dist\config" mkdir "dist\config"
 copy /Y "config\config.example.ini" "dist\config\config.example.ini" >nul
+copy /Y "config\config.wincc.ini" "dist\config\config.wincc.ini" >nul
 if not exist "dist\service" mkdir "dist\service"
 copy /Y "service\install-service.ps1" "dist\service\install-service.ps1" >nul
 copy /Y "service\remove-service.ps1" "dist\service\remove-service.ps1" >nul
@@ -33,6 +34,7 @@ copy /Y "firmware\src\main.cpp" "dist\firmware\src\" >nul
 copy /Y "firmware\include\secrets.example.h" "dist\firmware\include\" >nul
 
 if not exist "dist\tools" mkdir "dist\tools"
+copy /Y "tools\Install-All.bat" "dist\Install-All.bat" >nul
 copy /Y "tools\Install-CP2102-and-PlatformIO.ps1" "dist\tools\" >nul
 copy /Y "tools\Install-CP2102-and-PlatformIO.bat" "dist\tools\" >nul
 copy /Y "tools\README.md" "dist\tools\" >nul

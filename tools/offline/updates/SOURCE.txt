@@ -1,0 +1,11 @@
+Windows 7 SP1 updates required by the 32-bit PLCBridge EXEs (Python 3.8).
+
+- Windows6.1-KB2533623-x86.msu
+  LoadLibraryEx SEARCH flags. Without this, Setup fails with:
+  DLL load failed while importing _socket: The parameter is incorrect.
+
+- Windows6.1-KB2999226-x86.msu
+  Universal C Runtime. Without this, Setup fails with missing
+  api-ms-win-crt-runtime-l1-1-0.dll.
+
+Do not copy Win10 ucrtbase.dll next to the EXEs.

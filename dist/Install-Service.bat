@@ -11,7 +11,7 @@ if not exist "%EXE%" (
   exit /b 1
 )
 if not exist "%CFG%" (
-  if exist "%~dp0config\config.lab.ini" copy /Y "%~dp0config\config.lab.ini" "%CFG%" >nul
+  if exist "%~dp0config\config.wincc.ini" copy /Y "%~dp0config\config.wincc.ini" "%CFG%" >nul
   if exist "%~dp0config\config.example.ini" if not exist "%CFG%" copy /Y "%~dp0config\config.example.ini" "%CFG%" >nul
 )
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^

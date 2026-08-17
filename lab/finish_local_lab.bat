@@ -1,7 +1,7 @@
 @echo off
 cd /d D:\work\kar-khane-ard
 echo === Local lab finish ===
-echo MySQL Docker :3307  Mock API :8089  Bridge service
+echo SQL Server WinCC + Mock API :8089  Bridge service
 echo.
 echo Waiting for ESP32 (CP2102)... Please unplug/replug USB if needed.
 :wait
@@ -30,5 +30,5 @@ echo.
 echo === Mock API log ===
 powershell -NoProfile -Command "Get-Content 'D:\work\kar-khane-ard\logs\mock-api-out.txt' -Tail 40 -ErrorAction SilentlyContinue"
 echo.
-echo Done. New MySQL rows should appear in mock-api-out.txt
+echo Done. New WinCC rows should appear in mock-api-out.txt
 pause

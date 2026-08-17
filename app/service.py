@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 
 import servicemanager
@@ -13,8 +14,11 @@ from .main import BridgeApplication
 
 class PLCBridgeService(win32serviceutil.ServiceFramework):
     _svc_name_ = "PLCBridge"
-    _svc_display_name_ = "PLC MySQL to ESP32 Bridge"
-    _svc_description_ = "Reliably forwards new local MySQL records through an ESP32 to a remote API."
+    _svc_display_name_ = "PLC WinCC to ESP32 Bridge"
+    _svc_description_ = "Forwards new WinCC / SQL Server Tag Logging records through an ESP32 to a remote API."
+    if getattr(sys, "frozen", False):
+        _exe_name_ = sys.executable
+        _exe_args_ = ""
 
     def __init__(self, args):
         super().__init__(args)

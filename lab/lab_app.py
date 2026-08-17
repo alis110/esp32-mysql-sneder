@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -24,7 +23,14 @@ if getattr(sys, "frozen", False):
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.database import DEFAULT_WINCC_QUERY
+
 CP2102 = ("10C4", "EA60")
+CH340 = ("1A86", "7523")
+CH9102 = ("1A86", "55D4")
+USB_UART = {CP2102, CH340, CH9102, ("0403", "6001")}  # FTDI
+# Laptop Docker receiver on Wi-Fi Alissss (factory ESP posts here).
+LAB_API_URL = "http://10.33.97.45/api/plc-records"
 SECRETS_H = ROOT / "firmware" / "include" / "secrets.h"
 LAB_CONFIG = ROOT / "config" / "config.lab.ini"
 MOCK_API_PORT = 8089
@@ -104,6 +110,12 @@ def probe_api_url(url: str) -> tuple[bool, str]:
         with socket.create_connection((host, port), timeout=2.0):
             return True, f"OK {host}:{port}"
     except OSError as exc:
+        err = str(exc)
+        if "10051" in err or "unreachable" in err.lower():
+            return False, (
+                f"FAIL this PC has no route to {host} "
+                "(normal here — ESP uses Wi-Fi Alissss, not this PC)"
+            )
         return False, f"FAIL {exc}"
 
 
@@ -174,7 +186,27 @@ def _create_no_window() -> int:
 
 
 def local_ipv4() -> str:
-    """Prefer real LAN/Wi-Fi IPv4 (ESP must reach this). Skip localhost / APIPA / virtual NICs."""
+    """Prefer a real LAN IPv4. Windows 7 has no Get-NetIPAddress (PowerShell 2)."""
+    try:
+        raw = subprocess.check_output(
+            ["ipconfig"],
+            text=True,
+            encoding="oem",
+            errors="replace",
+            creationflags=_create_no_window(),
+        )
+        for line in raw.splitlines():
+            low = line.lower()
+            if "ipv4" not in low and "ip address" not in low:
+                continue
+            if ":" not in line:
+                continue
+            ip = line.split(":")[-1].strip()
+            if ip.startswith("127.") or ip.startswith("169.254.") or not ip[:1].isdigit():
+                continue
+            return ip
+    except (OSError, subprocess.CalledProcessError):
+        pass
     try:
         raw = subprocess.check_output(
             [
@@ -210,6 +242,11 @@ def local_ipv4() -> str:
     return "127.0.0.1"
 
 
+def default_api_url() -> str:
+    """ESP must reach the laptop API, not this PC's 127.0.0.1."""
+    return LAB_API_URL
+
+
 def list_esp_ports() -> list[dict]:
     from serial.tools import list_ports
 
@@ -217,11 +254,19 @@ def list_esp_ports() -> list[dict]:
     for port in list_ports.comports():
         vid = f"{port.vid:04X}" if port.vid is not None else ""
         pid = f"{port.pid:04X}" if port.pid is not None else ""
+        desc = (port.description or "") + " " + (port.hwid or "")
+        desc_l = desc.lower()
+        is_esp = (vid, pid) in USB_UART or any(
+            token in desc_l
+            for token in ("cp210", "silicon labs", "ch340", "ch910", "usb-serial", "usb serial")
+        )
+        if port.device and port.device.upper() in {"COM1"}:
+            is_esp = False
         found.append(
             {
                 "device": port.device,
                 "description": port.description or "",
-                "is_esp": (vid, pid) == CP2102,
+                "is_esp": is_esp,
             }
         )
     return found
@@ -359,35 +404,56 @@ def ssid_display(item: dict) -> str:
     return f"{item['ssid']}{suffix}"
 
 
-def mysql_probe(host: str, port: int, database: str, user: str, password: str) -> tuple[bool, str]:
-    try:
-        import mysql.connector
-    except ImportError:
-        return False, "mysql connector missing"
-    try:
-        conn = mysql.connector.connect(
-            host=host,
-            port=port,
-            database=database or None,
-            user=user,
-            password=password,
-            connection_timeout=4,
-        )
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.fetchone()
-        extra = ""
-        try:
-            cur.execute("SELECT COUNT(*), COALESCE(MAX(id),0) FROM lab_events")
-            count, max_id = cur.fetchone()
-            extra = f" | lab_events rows={count} max_id={max_id}"
-        except Exception:  # noqa: BLE001
-            pass
-        cur.close()
-        conn.close()
-        return True, f"connected {host}:{port}/{database or ''}{extra}"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+WINCC_QUERY = DEFAULT_WINCC_QUERY
+
+ENGINE_LABELS = {"sqlserver": "SQL Server (WinCC)"}
+AUTH_LABELS = {"windows": "Windows (no password)", "sql": "SQL login (user/pass)"}
+
+
+def _engine_key(label: str) -> str:
+    return "sqlserver"
+
+
+def _auth_key(label: str) -> str:
+    raw = (label or "").strip().lower()
+    if raw.startswith("windows") or raw in {"trusted", "integrated"}:
+        return "windows"
+    return "sql"
+
+
+def wincc_ssms_host() -> str:
+    """Same Server name SSMS shows: COMPUTER\\WINCC (e.g. CPUPC01\\WINCC)."""
+    name = (os.environ.get("COMPUTERNAME") or "").strip()
+    return f"{name}\\WINCC" if name else ".\\WINCC"
+
+
+def sqlserver_probe(
+    host: str,
+    port: int,
+    database: str,
+    auth: str,
+    user: str,
+    password: str,
+) -> tuple[bool, str]:
+    from app.config import DatabaseConfig
+    from app.database import probe_database
+
+    cfg = DatabaseConfig(
+        enabled=True,
+        engine="sqlserver",
+        auth=auth,
+        host=host or ".\\WINCC",
+        port=port,
+        database=database or "auto",
+        username=user,
+        password=password,
+        odbc_driver="",
+        query=WINCC_QUERY,
+        id_column="id",
+        batch_size=1,
+        connect_timeout_seconds=4,
+    )
+    return probe_database(cfg)
 
 
 def write_secrets(ssid: str, password: str, api_url: str, api_token: str) -> Path:
@@ -470,6 +536,7 @@ def resolve_setup_exe() -> Path | None:
     candidates = [
         ROOT / "PLCBridgeSetup.exe",
         ROOT / "dist" / "PLCBridgeSetup.exe",
+        ROOT / "system-install" / "PLCBridgeSetup.exe",
         Path(r"C:\Program Files\PLCBridge\PLCBridgeSetup.exe"),
     ]
     for path in candidates:
@@ -551,10 +618,136 @@ def set_ui_at_login(enabled: bool) -> tuple[bool, str]:
     return True, str(shortcut)
 
 
+def find_pack_file(*relative: str) -> Path | None:
+    """File next to the frozen EXE (USB pack) or under the repo root."""
+    bases = [ROOT]
+    if getattr(sys, "frozen", False):
+        bases.insert(0, Path(sys.executable).resolve().parent)
+    for base in bases:
+        path = base.joinpath(*relative)
+        if path.is_file():
+            return path
+    return None
+
+
+def find_install_all_bat() -> Path | None:
+    return (
+        find_pack_file("Install-All.bat")
+        or find_pack_file("tools", "Install-All.bat")
+        or find_pack_file("system-install", "Install-All.bat")
+        or find_pack_file("dist", "Install-All.bat")
+    )
+
+
+def find_uninstall_bat() -> Path | None:
+    return (
+        find_pack_file("Uninstall-Service.bat")
+        or find_pack_file("system-install", "Uninstall-Service.bat")
+        or find_pack_file("dist", "Uninstall-Service.bat")
+    )
+
+
+def find_esptool() -> Path | None:
+    found = shutil.which("esptool") or shutil.which("esptool.exe")
+    if found:
+        return Path(found)
+    return find_pack_file("esptool.exe")
+
+
+def find_firmware_bin_dir() -> Path | None:
+    for rel in (
+        ("firmware-bin",),
+        ("tools", "offline", "firmware-bin"),
+    ):
+        bases = [ROOT]
+        if getattr(sys, "frozen", False):
+            bases.insert(0, Path(sys.executable).resolve().parent)
+        for base in bases:
+            path = base.joinpath(*rel)
+            if (path / "firmware.bin").is_file():
+                return path
+    return None
+
+
+def flash_prebuilt_firmware(port: str) -> tuple[int, str]:
+    """Flash firmware-bin with bundled esptool (no PlatformIO / no internet)."""
+    tool = find_esptool()
+    bindir = find_firmware_bin_dir()
+    if not tool:
+        return 1, "esptool.exe not found next to Setup."
+    if not bindir:
+        return 1, "firmware-bin\\firmware.bin not found."
+    boot = bindir / "bootloader.bin"
+    parts = bindir / "partitions.bin"
+    fw = bindir / "firmware.bin"
+    missing = [p.name for p in (boot, parts, fw) if not p.is_file()]
+    if missing:
+        return 1, "Missing in firmware-bin: " + ", ".join(missing)
+    proc = subprocess.run(
+        [
+            str(tool),
+            "--chip",
+            "esp32",
+            "--port",
+            port,
+            "--baud",
+            "115200",
+            "--before",
+            "default_reset",
+            "--after",
+            "hard_reset",
+            "--connect-attempts",
+            "20",
+            "--no-stub",
+            "write_flash",
+            "-z",
+            "0x1000",
+            str(boot),
+            "0x8000",
+            str(parts),
+            "0x10000",
+            str(fw),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        creationflags=_create_no_window(),
+    )
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode, out[-2000:] if out else f"exit {proc.returncode}"
+
+
+def elevate_and_wait(file_path: Path, args: str = "") -> tuple[int, str]:
+    """UAC-elevate a .bat/.exe and wait. Works on Windows 7 PowerShell 2."""
+    def q(s: str) -> str:
+        return s.replace("'", "''")
+
+    arg = f" -ArgumentList '{q(args)}'" if args.strip() else ""
+    ps = (
+        f"Start-Process -FilePath '{q(str(file_path))}'{arg} -Verb RunAs -Wait"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            creationflags=_create_no_window(),
+        )
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except OSError as exc:
+        return 1, str(exc)
+
+
 def resolve_bridge_exe() -> Path | None:
     candidates = [
         ROOT / "PLCBridge.exe",
         ROOT / "dist" / "PLCBridge.exe",
+        ROOT / "system-install" / "PLCBridge.exe",
         Path(r"C:\Program Files\PLCBridge\PLCBridge.exe"),
     ]
     for path in candidates:
@@ -577,15 +770,14 @@ class LabApp(tk.Tk):
     _OK = "#047857"
     _BAD = "#B91C1C"
     _FONT = ("Segoe UI", 9)
-    _FONT_BOLD = ("Segoe UI Semibold", 9)
-    _FONT_TITLE = ("Segoe UI Semibold", 12)
+    _FONT_BOLD = ("Segoe UI", 9, "bold")
+    _FONT_TITLE = ("Segoe UI", 12, "bold")
     _FONT_MONO = ("Consolas", 9)
 
     def __init__(self) -> None:
         super().__init__()
         self.title("PLCBridge Setup")
-        self.geometry("1120x720")
-        self.minsize(900, 620)
+        self._fit_to_screen()
         self._log_q: queue.Queue[str] = queue.Queue()
         self._api_log_q: queue.Queue[str] = queue.Queue()
         self._esp_log_q: queue.Queue[str] = queue.Queue()
@@ -614,12 +806,23 @@ class LabApp(tk.Tk):
         self._bind_clipboard_widget(self.txt)
         self._bind_clipboard_widget(self.txt_api)
         self._bind_clipboard_widget(self.txt_esp)
+        self._bind_clipboard_widget(self.txt_db)
         self.after(200, self._drain_log)
         self.after(200, self._drain_api_log)
         self.after(200, self._drain_esp_log)
         self.refresh_status(silent=False)
         self.after(4000, self._live_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _fit_to_screen(self) -> None:
+        """Win7 operator monitors are often 1024x768; Segoe Semibold is missing there."""
+        self.update_idletasks()
+        sw = int(self.winfo_screenwidth() or 1024)
+        sh = int(self.winfo_screenheight() or 768)
+        w = min(980, max(800, sw - 24))
+        h = min(720, max(560, sh - 64))
+        self.geometry(f"{w}x{h}+4+4")
+        self.minsize(min(760, sw - 16), min(480, sh - 48))
 
     def _apply_theme(self) -> None:
         self.configure(bg=self._BG)
@@ -648,11 +851,11 @@ class LabApp(tk.Tk):
         )
         style.configure("TLabel", background=self._CARD, foreground=self._TEXT, font=self._FONT)
         style.configure("Muted.TLabel", background=self._CARD, foreground=self._MUTED, font=self._FONT)
-        style.configure("Hint.TLabel", background=self._BG, foreground=self._MUTED, font=("Segoe UI", 8))
+        style.configure("Hint.TLabel", background=self._BG, foreground=self._MUTED, font=self._FONT)
         style.configure("Title.TLabel", background=self._BG, foreground=self._TEXT, font=self._FONT_TITLE)
         style.configure("Subtitle.TLabel", background=self._BG, foreground=self._MUTED, font=self._FONT)
         style.configure("Field.TLabel", background=self._CARD, foreground=self._MUTED, font=self._FONT)
-        style.configure("StatusKey.TLabel", background=self._CARD, foreground=self._MUTED, font=("Segoe UI", 8))
+        style.configure("StatusKey.TLabel", background=self._CARD, foreground=self._MUTED, font=self._FONT)
         style.configure("StatusVal.TLabel", background=self._CARD, foreground=self._TEXT, font=self._FONT)
         style.configure("Ok.TLabel", background=self._CARD, foreground=self._OK, font=self._FONT_BOLD)
         style.configure("Bad.TLabel", background=self._CARD, foreground=self._BAD, font=self._FONT_BOLD)
@@ -687,7 +890,7 @@ class LabApp(tk.Tk):
         style.configure(
             "TButton",
             font=self._FONT,
-            padding=(8, 3),
+            padding=(10, 5),
             background="#FFFFFF",
             foreground=self._TEXT,
             bordercolor=self._BORDER,
@@ -716,6 +919,23 @@ class LabApp(tk.Tk):
             background=[("active", self._ACCENT_HOVER), ("pressed", "#115E59")],
             foreground=[("active", "#FFFFFF"), ("disabled", "#94A3B8")],
             bordercolor=[("active", self._ACCENT_HOVER)],
+        )
+        style.configure(
+            "Flash.TButton",
+            font=self._FONT_BOLD,
+            padding=(12, 6),
+            background="#0F766E",
+            foreground="#FFFFFF",
+            bordercolor="#0F766E",
+            lightcolor="#0F766E",
+            darkcolor="#0F766E",
+            focuscolor=self._ACCENT_HOVER,
+        )
+        style.map(
+            "Flash.TButton",
+            background=[("active", "#0D9488"), ("pressed", "#115E59")],
+            foreground=[("active", "#FFFFFF")],
+            bordercolor=[("active", "#0D9488")],
         )
         style.configure(
             "Danger.TButton",
@@ -1051,6 +1271,10 @@ class LabApp(tk.Tk):
         threading.Thread(target=reader, daemon=True, name="esp-serial").start()
 
     def _on_close(self) -> None:
+        try:
+            self.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
         self.destroy()
 
     def _enable_clipboard(self, root: tk.Misc) -> None:
@@ -1098,9 +1322,46 @@ class LabApp(tk.Tk):
         )
         widget.grid(row=row, column=base + 1, sticky=tk.EW, padx=(0, 10), pady=1)
 
+    def _on_root_wheel(self, event):
+        widget = event.widget
+        try:
+            w = widget
+            while w is not None:
+                if w.winfo_class() == "Text":
+                    return
+                parent = w.winfo_parent()
+                w = w.nametowidget(parent) if parent else None
+        except (tk.TclError, KeyError):
+            pass
+        delta = int(-event.delta / 120) if getattr(event, "delta", 0) else 0
+        if delta:
+            self._root_canvas.yview_scroll(delta, "units")
+        return "break"
+
     def _build(self) -> None:
-        frm = ttk.Frame(self, padding=(10, 6, 10, 8))
-        frm.pack(fill=tk.BOTH, expand=True)
+        shell = ttk.Frame(self)
+        shell.pack(fill=tk.BOTH, expand=True)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+
+        self._root_canvas = tk.Canvas(shell, highlightthickness=0, bg=self._BG, bd=0)
+        vsb = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=self._root_canvas.yview)
+        self._root_canvas.configure(yscrollcommand=vsb.set)
+        self._root_canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        vsb.grid(row=0, column=1, sticky=tk.NS)
+
+        frm = ttk.Frame(self._root_canvas, padding=(6, 4, 8, 8))
+        self._root_win = self._root_canvas.create_window((0, 0), window=frm, anchor=tk.NW)
+
+        def on_frm_cfg(_event=None) -> None:
+            self._root_canvas.configure(scrollregion=self._root_canvas.bbox("all"))
+
+        def on_can_cfg(event) -> None:
+            self._root_canvas.itemconfigure(self._root_win, width=max(event.width, 1))
+
+        frm.bind("<Configure>", on_frm_cfg)
+        self._root_canvas.bind("<Configure>", on_can_cfg)
+
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(4, weight=1)
 
@@ -1109,7 +1370,7 @@ class LabApp(tk.Tk):
         ttk.Label(header, text='PLCBridge Setup', style='Title.TLabel').pack(side=tk.LEFT)
         ttk.Label(
             header,
-            text='  ·  ESP32 · MySQL · Service',
+            text='  ·  ESP32 · SQL Server (WinCC) · Service',
             style='Subtitle.TLabel',
         ).pack(side=tk.LEFT, pady=2)
 
@@ -1124,19 +1385,27 @@ class LabApp(tk.Tk):
             cell = ttk.Frame(parent, style='Card.TFrame', padding=(2, 0))
             cell.grid(row=r, column=c, sticky=tk.EW, padx=2, pady=0)
             ttk.Label(cell, text=key, style='StatusKey.TLabel').pack(anchor=tk.W)
-            val = ttk.Label(cell, text='…', style='StatusVal.TLabel', wraplength=200)
+            val = ttk.Label(cell, text='…', style='StatusVal.TLabel', wraplength=220)
             val.pack(anchor=tk.W)
             return val
 
         self.lbl_esp = status_cell(status_grid, 0, 0, 'ESP32 USB')
         self.lbl_wifi = status_cell(status_grid, 0, 1, 'PC Wi-Fi')
-        self.lbl_mysql = status_cell(status_grid, 0, 2, 'MySQL')
-        self.lbl_api_target = status_cell(status_grid, 0, 3, 'Target API (from PC)')
+        self.lbl_api_target = status_cell(status_grid, 0, 2, 'Target API (from PC)')
+        self.lbl_svc = status_cell(status_grid, 0, 3, 'Bridge Service')
         self.lbl_api = status_cell(status_grid, 1, 0, 'Mock API listener')
-        self.lbl_svc = status_cell(status_grid, 1, 1, 'Bridge Service')
-        self.lbl_ui_boot = status_cell(status_grid, 1, 2, 'UI at login')
-        self.lbl_live = status_cell(status_grid, 1, 3, 'Watch')
+        self.lbl_ui_boot = status_cell(status_grid, 1, 1, 'UI at login')
+        self.lbl_live = status_cell(status_grid, 1, 2, 'Watch')
         self.lbl_live.configure(text='every 4s · changes → App Log')
+
+        db_box = ttk.Frame(status, style='Card.TFrame')
+        db_box.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        ttk.Label(db_box, text='Database (scroll)', style='StatusKey.TLabel').pack(anchor=tk.W)
+        self.txt_db = scrolledtext.ScrolledText(db_box, height=7, wrap=tk.WORD)
+        self._style_text(self.txt_db)
+        self.txt_db.pack(fill=tk.BOTH, expand=True)
+        self.txt_db.insert('1.0', 'Click Check DB — same as SSMS: Windows Authentication, no password.')
+        self.txt_db.configure(state=tk.DISABLED)
 
 
         cfg = ttk.LabelFrame(frm, text=' Settings ', padding=(6, 4))
@@ -1150,20 +1419,17 @@ class LabApp(tk.Tk):
         self.var_wifi_pass = tk.StringVar()
         self.var_show_wifi_pass = tk.BooleanVar(value=False)
         self.var_show_db_pass = tk.BooleanVar(value=False)
-        self.var_api = tk.StringVar(value=f'http://{local_ipv4()}:8089/api/plc-records')
+        self.var_api = tk.StringVar(value=default_api_url())
         self.var_token = tk.StringVar(value='lab-token')
         self.var_port = tk.StringVar(value='auto')
-        self.var_db_host = tk.StringVar(value='127.0.0.1')
-        self.var_db_port = tk.StringVar(value='3307')
-        self.var_db_name = tk.StringVar(value='plcbridge_lab')
-        self.var_db_user = tk.StringVar(value='bridge')
-        self.var_db_pass = tk.StringVar(value='bridge')
-        self.var_db_query = tk.StringVar(
-            value=(
-                "SELECT id, temperature, note, created_at FROM lab_events "
-                "WHERE id > %(last_id)s ORDER BY id ASC LIMIT %(batch_size)s"
-            )
-        )
+        self.var_engine = tk.StringVar(value=ENGINE_LABELS['sqlserver'])
+        self.var_auth = tk.StringVar(value=AUTH_LABELS['windows'])
+        self.var_db_host = tk.StringVar(value=wincc_ssms_host())
+        self.var_db_port = tk.StringVar(value='0')
+        self.var_db_name = tk.StringVar(value='auto')
+        self.var_db_user = tk.StringVar(value='')
+        self.var_db_pass = tk.StringVar(value='')
+        self.var_db_query = tk.StringVar(value=WINCC_QUERY)
         self.var_id_column = tk.StringVar(value='id')
         self._wifi_items: list[dict] = []
         self._ssid_by_display: dict[str, str] = {}
@@ -1184,16 +1450,36 @@ class LabApp(tk.Tk):
             pass_row, text='Show', variable=self.var_show_wifi_pass, command=self._toggle_wifi_pass
         ).pack(side=tk.LEFT, padx=(4, 0))
         self._pair(grid, 1, 0, 'Wi-Fi Pass', pass_row)
-        self._pair(grid, 1, 1, 'MySQL Host', ttk.Entry(grid, textvariable=self.var_db_host))
+        self.cmb_engine = ttk.Combobox(
+            grid,
+            textvariable=self.var_engine,
+            values=list(ENGINE_LABELS.values()),
+            state='readonly',
+            width=22,
+        )
+        self.cmb_engine.bind('<<ComboboxSelected>>', self._on_engine_selected)
+        self._pair(grid, 1, 1, 'Engine', self.cmb_engine)
 
         self._pair(grid, 2, 0, 'API URL', ttk.Entry(grid, textvariable=self.var_api))
-        self._pair(grid, 2, 1, 'MySQL Port', ttk.Entry(grid, textvariable=self.var_db_port, width=12))
+        self.cmb_auth = ttk.Combobox(
+            grid,
+            textvariable=self.var_auth,
+            values=list(AUTH_LABELS.values()),
+            state='readonly',
+            width=22,
+        )
+        self.cmb_auth.bind('<<ComboboxSelected>>', lambda _e: self._toggle_auth_fields())
+        self._pair(grid, 2, 1, 'Auth', self.cmb_auth)
 
         self._pair(grid, 3, 0, 'API Token', ttk.Entry(grid, textvariable=self.var_token, show='*'))
-        self._pair(grid, 3, 1, 'Database', ttk.Entry(grid, textvariable=self.var_db_name))
+        self._pair(grid, 3, 1, 'Host', ttk.Entry(grid, textvariable=self.var_db_host))
 
         self._pair(grid, 4, 0, 'ID column', ttk.Entry(grid, textvariable=self.var_id_column, width=12))
-        self._pair(grid, 4, 1, 'MySQL User', ttk.Entry(grid, textvariable=self.var_db_user))
+        self._pair(grid, 4, 1, 'Port', ttk.Entry(grid, textvariable=self.var_db_port, width=12))
+
+        self._pair(grid, 5, 0, 'Database', ttk.Entry(grid, textvariable=self.var_db_name))
+        self.ent_db_user = ttk.Entry(grid, textvariable=self.var_db_user)
+        self._pair(grid, 5, 1, 'User', self.ent_db_user)
 
         db_pass_row = ttk.Frame(grid, style='Card.TFrame')
         self.ent_db_pass = ttk.Entry(db_pass_row, textvariable=self.var_db_pass, show='*')
@@ -1201,17 +1487,17 @@ class LabApp(tk.Tk):
         ttk.Checkbutton(
             db_pass_row, text='Show', variable=self.var_show_db_pass, command=self._toggle_db_pass
         ).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(grid, text='MySQL Pass', style='Field.TLabel').grid(
-            row=5, column=0, sticky=tk.W, padx=(0, 6), pady=1
+        ttk.Label(grid, text='Password', style='Field.TLabel').grid(
+            row=6, column=0, sticky=tk.W, padx=(0, 6), pady=1
         )
-        db_pass_row.grid(row=5, column=1, columnspan=3, sticky=tk.EW, pady=1)
+        db_pass_row.grid(row=6, column=1, columnspan=3, sticky=tk.EW, pady=1)
 
         ttk.Label(grid, text='Query', style='Field.TLabel').grid(
-            row=6, column=0, sticky=tk.NW, padx=(0, 6), pady=1
+            row=7, column=0, sticky=tk.NW, padx=(0, 6), pady=1
         )
-        self.txt_query = tk.Text(grid, height=2, wrap=tk.WORD)
+        self.txt_query = tk.Text(grid, height=3, wrap=tk.WORD)
         self._style_text(self.txt_query)
-        self.txt_query.grid(row=6, column=1, columnspan=3, sticky=tk.EW, pady=1)
+        self.txt_query.grid(row=7, column=1, columnspan=3, sticky=tk.EW, pady=1)
         self.txt_query.insert('1.0', self.var_db_query.get())
 
         actions = ttk.LabelFrame(frm, text=' Actions ', padding=(6, 4))
@@ -1222,7 +1508,8 @@ class LabApp(tk.Tk):
         for text_btn, cmd in (
             ('Refresh', self.refresh_status),
             ('Scan Wi-Fi', self.scan_wifi),
-            ('Check MySQL', self.refresh_status),
+            ('Check DB', self.check_db),
+            ('WinCC factory', self.apply_wincc_defaults),
             ('Start', self.start_service),
             ('Stop', self.stop_service),
         ):
@@ -1233,11 +1520,14 @@ class LabApp(tk.Tk):
 
         row2 = ttk.Frame(actions, style='Card.TFrame')
         row2.pack(fill=tk.X)
-        ttk.Button(row2, text='Setup ESP32', style='Accent.TButton', command=self.setup_esp).pack(
+        ttk.Button(row2, text='Install All', command=self.install_all).pack(
             side=tk.LEFT, padx=(0, 3)
         )
         ttk.Button(
-            row2, text='Install Service', style='Accent.TButton', command=self.install_service
+            row2, text='FLASH ESP32 NOW', style='Flash.TButton', command=self.setup_esp
+        ).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(
+            row2, text='Install Service', command=self.install_service
         ).pack(side=tk.LEFT, padx=(0, 3))
         ttk.Button(
             row2, text='Uninstall', style='Danger.TButton', command=self.uninstall_service
@@ -1246,9 +1536,6 @@ class LabApp(tk.Tk):
             side=tk.LEFT, padx=(0, 3)
         )
         ttk.Button(row2, text='Hide UI login', command=self.disable_ui_at_login).pack(side=tk.LEFT)
-        ttk.Button(row2, text='CP2102 + PIO tools', command=self.open_factory_tools).pack(
-            side=tk.LEFT, padx=(12, 0)
-        )
 
         log_panes = ttk.Panedwindow(frm, orient=tk.HORIZONTAL)
         log_panes.grid(row=4, column=0, sticky=tk.NSEW)
@@ -1319,13 +1606,80 @@ class LabApp(tk.Tk):
         log_panes.add(api_box, weight=1)
         log_panes.add(esp_box, weight=1)
 
+        self._toggle_auth_fields()
         self.after(100, self.scan_wifi)
+        self.bind_all("<MouseWheel>", self._on_root_wheel)
 
     def _toggle_wifi_pass(self) -> None:
         self.ent_wifi_pass.configure(show="" if self.var_show_wifi_pass.get() else "*")
 
     def _toggle_db_pass(self) -> None:
         self.ent_db_pass.configure(show="" if self.var_show_db_pass.get() else "*")
+
+    def _engine_value(self) -> str:
+        return _engine_key(self.var_engine.get())
+
+    def _auth_value(self) -> str:
+        return _auth_key(self.var_auth.get())
+
+    def _toggle_auth_fields(self) -> None:
+        windows = self._auth_value() == "windows"
+        state = tk.DISABLED if windows else tk.NORMAL
+        self.ent_db_user.configure(state=state)
+        self.ent_db_pass.configure(state=state)
+
+    def _on_engine_selected(self, _event=None) -> None:
+        self.var_engine.set(ENGINE_LABELS["sqlserver"])
+        self._toggle_auth_fields()
+
+    def apply_wincc_defaults(self) -> None:
+        host = wincc_ssms_host()
+        self.var_engine.set(ENGINE_LABELS["sqlserver"])
+        self.var_auth.set(AUTH_LABELS["windows"])
+        self.var_db_host.set(host)
+        self.var_db_port.set("0")
+        self.var_db_name.set("auto")
+        self.var_db_user.set("")
+        self.var_db_pass.set("")
+        self.var_id_column.set("id")
+        self._set_query(WINCC_QUERY)
+        self._toggle_auth_fields()
+        self.log(
+            f"SSMS connection: Server={host}  Authentication=Windows  "
+            "User=this Windows account  Password=none  database=auto (latest TLG_F)."
+        )
+        self.check_db()
+
+    def check_db(self) -> None:
+        """Probe SQL Server like SSMS (Windows auth, no password) and show the result."""
+        self.var_auth.set(AUTH_LABELS["windows"])
+        if not self.var_db_host.get().strip():
+            self.var_db_host.set(wincc_ssms_host())
+        self.var_db_user.set("")
+        self.var_db_pass.set("")
+        self._toggle_auth_fields()
+        name = self.var_db_name.get().strip()
+        if name.upper().startswith("CC_"):
+            self.log(
+                f"Database '{name}' is a WinCC CS/RT catalog, not Tag Logging. "
+                "Switching to auto (newest TLG_F) so flow values can be read."
+            )
+            self.var_db_name.set("auto")
+        self.refresh_status(silent=False)
+        mysql_txt = self._status_snapshot.get("Database") or ""
+        if mysql_txt.startswith("OK"):
+            pd = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "PLCBridge" / "config" / "config.ini"
+            try:
+                self._write_bridge_config(pd)
+                self.log(f"Saved for the Windows service: {pd}")
+            except OSError as exc:
+                self.log(f"Could not save service config: {exc}")
+        else:
+            self.log("Check DB failed. Confirm SSMS opens with Windows Authentication on this PC.")
+
+    def _set_query(self, query: str) -> None:
+        self.txt_query.delete("1.0", tk.END)
+        self.txt_query.insert("1.0", query)
 
     def _selected_ssid(self) -> str:
         raw = self.var_ssid.get().strip()
@@ -1434,6 +1788,14 @@ class LabApp(tk.Tk):
         style = {"ok": "Ok.TLabel", "bad": "Bad.TLabel", "warn": "Warn.TLabel"}.get(kind, "StatusVal.TLabel")
         label.configure(text=text, style=style)
 
+    def _paint_db_status(self, text: str, kind: str = "val") -> None:
+        colors = {"ok": self._OK, "bad": self._BAD, "warn": "#B45309"}
+        self.txt_db.configure(state=tk.NORMAL)
+        self.txt_db.delete("1.0", tk.END)
+        self.txt_db.insert("1.0", text.replace(" | ", "\n"))
+        self.txt_db.configure(fg=colors.get(kind, self._TEXT), state=tk.DISABLED)
+        self.txt_db.see("1.0")
+
     def _note_change(self, key: str, value: str, silent: bool) -> None:
         prev = self._status_snapshot.get(key)
         self._status_snapshot[key] = value
@@ -1527,7 +1889,7 @@ class LabApp(tk.Tk):
                 self.var_port.set(esp["device"])
         else:
             other = ", ".join(p["device"] for p in ports) or "none"
-            esp_txt = f"not found (ports: {other})"
+            esp_txt = f"not found — plug data USB + Refresh (now: {other})"
             self._paint_status(self.lbl_esp, esp_txt, "bad")
         self._note_change("ESP32", esp_txt, silent)
 
@@ -1541,23 +1903,20 @@ class LabApp(tk.Tk):
             self._fill_password_for_current_ssid()
 
         try:
-            port = int(self.var_db_port.get().strip() or "3306")
+            port = int(self.var_db_port.get().strip() or "0")
         except ValueError:
-            port = 3306
-        if self.var_db_user.get().strip():
-            ok, detail = mysql_probe(
-                self.var_db_host.get().strip() or "127.0.0.1",
-                port,
-                self.var_db_name.get().strip(),
-                self.var_db_user.get().strip(),
-                self.var_db_pass.get(),
-            )
-            mysql_txt = f"{'OK' if ok else 'FAIL'} — {detail}"
-            self._paint_status(self.lbl_mysql, mysql_txt, "ok" if ok else "bad")
-        else:
-            mysql_txt = "enter user/db above"
-            self._paint_status(self.lbl_mysql, mysql_txt, "warn")
-        self._note_change("MySQL", mysql_txt, silent)
+            port = 0
+        ok, detail = sqlserver_probe(
+            self.var_db_host.get().strip() or ".\\WINCC",
+            port,
+            self.var_db_name.get().strip() or "auto",
+            self._auth_value(),
+            self.var_db_user.get().strip(),
+            self.var_db_pass.get(),
+        )
+        mysql_txt = f"{'OK' if ok else 'FAIL'} — {detail}"
+        self._paint_db_status(mysql_txt, "ok" if ok else "bad")
+        self._note_change("Database", mysql_txt, silent)
 
         api_ok, api_detail = probe_api_url(self.var_api.get().strip())
         self._paint_status(self.lbl_api_target, api_detail, "ok" if api_ok else "bad")
@@ -1601,9 +1960,9 @@ class LabApp(tk.Tk):
         )
 
         if not silent:
-            self.log(f"[{_ts()}] Status refreshed (ESP/MySQL/API/Service).")
+            self.log(f"[{_ts()}] Status refreshed (ESP/SQL Server/API/Service).")
             self._api_log(
-                f"[{_ts()}] Snapshot — Mock: {mock_txt} | Target: {api_detail} | MySQL: {mysql_txt}"
+                f"[{_ts()}] Snapshot — Mock: {mock_txt} | Target: {api_detail} | SQL Server: {mysql_txt}"
             )
 
     def _sync_mock_api_button(self) -> None:
@@ -1712,59 +2071,110 @@ class LabApp(tk.Tk):
         self._sync_mock_api_button()
         self.refresh_status()
 
+    def _release_com_for_flash(self) -> None:
+        """Service and serial monitor both hold COM and block esptool reset."""
+        self.stop_esp_monitor("ESP32 serial monitor stopped for flashing.")
+        subprocess.run(
+            ["sc", "stop", "PLCBridge"],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=_create_no_window(),
+        )
+        time.sleep(2)
+
     def setup_esp(self) -> None:
         """Write Wi-Fi + API settings into firmware and flash the board in one step."""
         ssid = self._selected_ssid()
         password = self.var_wifi_pass.get()
         api_url = self.var_api.get().strip()
-        if not ssid or not password:
-            messagebox.showwarning("Setup ESP32", "Select Wi-Fi SSID and password first (Scan).")
+        pio = find_pio()
+        esptool = find_esptool()
+        bindir = find_firmware_bin_dir()
+        if pio and (not ssid or not password):
+            messagebox.showwarning("FLASH ESP32", "Select Wi-Fi SSID and password first (Scan).")
             return
         if not api_url:
-            messagebox.showwarning("Setup ESP32", "API URL is required.")
+            messagebox.showwarning("FLASH ESP32", "API URL is required.")
             return
-        if "5g" in ssid.lower() or "5ghz" in ssid.lower().replace(" ", ""):
+        if ssid and ("5g" in ssid.lower() or "5ghz" in ssid.lower().replace(" ", "")):
             if not messagebox.askyesno(
                 "Wi-Fi band",
                 f"SSID '{ssid}' looks like 5GHz.\nESP32 only supports 2.4GHz.\nContinue anyway?",
             ):
                 return
-        pio = find_pio()
-        if not pio:
-            messagebox.showerror("Setup ESP32", "PlatformIO (pio) not in PATH.")
+        if not pio and not (esptool and bindir):
+            messagebox.showerror(
+                "FLASH ESP32",
+                "No flash tool found.\n\n"
+                "On a PC with internet, install PlatformIO and use FLASH ESP32 NOW.\n"
+                "On the factory USB pack, keep esptool.exe and firmware-bin\\ next to Setup.",
+            )
             return
         port = self._esp_port()
         if not port:
-            messagebox.showerror("Setup ESP32", "ESP32 not found on USB.")
+            messagebox.showerror("FLASH ESP32", "ESP32 not found on USB.")
             return
 
-        # Flash needs exclusive COM access.
-        self.stop_esp_monitor("ESP32 serial monitor stopped for flashing.")
+        how = "PlatformIO" if pio else "esptool + firmware-bin"
+        if not messagebox.askyesno(
+            "FLASH ESP32 NOW",
+            f"This WRITES firmware onto the ESP32 on {port}.\n\n"
+            f"Tool: {how}\nWi-Fi in bin: Alissss (baked)\nAPI: {api_url}\n\n"
+            "1. Click Yes\n"
+            "2. Hold the BOOT button on the ESP32\n"
+            "3. Keep holding until Connecting... finishes\n"
+            "4. Then release BOOT\n\n"
+            "The Bridge service will be stopped so COM is free.",
+        ):
+            return
+
+        self._release_com_for_flash()
 
         def run() -> None:
             try:
-                path = write_secrets(ssid, password, api_url, self.var_token.get().strip() or "lab-token")
-                self.log(f"Config written: {path}")
-                self.log(f"Flashing ESP32 on {port} (Wi-Fi={ssid}, API={api_url})…")
-                proc = subprocess.run(
-                    [pio, "run", "-t", "upload", "--upload-port", port],
-                    cwd=str(ROOT / "firmware"),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                if pio:
+                    path = write_secrets(
+                        ssid, password, api_url, self.var_token.get().strip() or "lab-token"
+                    )
+                    self.log(f"Config written: {path}")
+                    self.log(f"Flashing ESP32 on {port} (Wi-Fi={ssid}, API={api_url})…")
+                    proc = subprocess.run(
+                        [pio, "run", "-t", "upload", "--upload-port", port],
+                        cwd=str(ROOT / "firmware"),
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if proc.stdout:
+                        self.log(proc.stdout[-1800:])
+                    if proc.stderr:
+                        self.log(proc.stderr[-1200:])
+                    if proc.returncode == 0:
+                        self.log(
+                            "ESP32 ready: joins Wi-Fi and waits for Bridge serial data → posts to API."
+                        )
+                        self.log("Tip: click Start on ESP32 Serial panel to watch boot / Wi-Fi logs.")
+                    else:
+                        self.log(f"FLASH ESP32 failed (code={proc.returncode}).")
+                    return
+                self.log(
+                    f"Flashing prebuilt firmware-bin on {port}. "
+                    "HOLD the BOOT button on the ESP32 now until Connecting finishes."
                 )
-                if proc.stdout:
-                    self.log(proc.stdout[-1800:])
-                if proc.stderr:
-                    self.log(proc.stderr[-1200:])
-                if proc.returncode == 0:
-                    self.log("ESP32 ready: joins Wi-Fi and waits for Bridge serial data → posts to API.")
-                    self.log("Tip: click Start on ESP32 Serial panel to watch boot / Wi-Fi logs.")
+                code, out = flash_prebuilt_firmware(port)
+                if out:
+                    self.log(out)
+                if code == 0:
+                    self.log("ESP32 flash OK (prebuilt bin). Click Start to run the Bridge service again.")
                 else:
-                    self.log(f"Setup ESP32 failed (code={proc.returncode}).")
+                    self.log(
+                        "FLASH ESP32 failed. Hold BOOT on the board, click FLASH ESP32 NOW again, "
+                        "release BOOT after Connecting...."
+                    )
             except Exception as exc:  # noqa: BLE001
-                self.log(f"Setup ESP32 error: {exc}")
+                self.log(f"FLASH ESP32 error: {exc}")
 
         self._worker(run)
 
@@ -1774,21 +2184,26 @@ class LabApp(tk.Tk):
         return self.var_db_query.get().strip()
 
     def _write_bridge_config(self, target: Path) -> None:
-        port = self.var_db_port.get().strip() or "3306"
+        engine = "sqlserver"
+        auth = self._auth_value()
+        port = self.var_db_port.get().strip() or "0"
         com = self.var_port.get().strip() or "auto"
         query = self._query_text().replace("\r\n", "\n")
-        # Indent multiline query for ini readability
         query_ini = "\n        ".join(query.split("\n"))
+        host = self.var_db_host.get().strip() or wincc_ssms_host()
+        database = self.var_db_name.get().strip() or "auto"
         content = f"""; Generated by PLCBridge Setup
 [database]
 enabled = true
-host = {self.var_db_host.get().strip() or "127.0.0.1"}
+engine = {engine}
+auth = {auth}
+host = {host}
 port = {port}
-database = {self.var_db_name.get().strip()}
+database = {database}
 username = {self.var_db_user.get().strip()}
 password = {self.var_db_pass.get()}
 id_column = {self.var_id_column.get().strip() or "id"}
-batch_size = 5
+batch_size = 1
 connect_timeout_seconds = 5
 query = {query_ini}
 
@@ -1801,7 +2216,7 @@ reconnect_delay_seconds = 5
 startup_delay_seconds = 3
 
 [runtime]
-poll_interval_seconds = 10
+poll_interval_seconds = 30
 retry_delay_seconds = 15
 state_db = ../data/state.sqlite3
 
@@ -1814,26 +2229,130 @@ backup_count = 3
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="\n")
 
-    def install_service(self) -> None:
-        exe = resolve_bridge_exe()
-        if not exe:
+    def _validate_install_inputs(self, title: str) -> bool:
+        if not resolve_bridge_exe():
             messagebox.showerror(
-                "Service",
-                "PLCBridge.exe not found next to this app.\nPut PLCBridge.exe beside PLCBridgeSetup.exe (dist folder).",
+                title,
+                "PLCBridge.exe not found next to this app.\n"
+                "Put PLCBridge.exe beside PLCBridgeSetup.exe.",
+            )
+            return False
+        auth = self._auth_value()
+        if not self.var_db_host.get().strip():
+            messagebox.showwarning(title, "Set SQL Server host (same as SSMS, e.g. CPUPC01\\WINCC), then Check DB.")
+            return False
+        if auth == "sql" and not self.var_db_user.get().strip():
+            messagebox.showwarning(title, "SQL login needs a username, or switch Auth to Windows.")
+            return False
+        if "%(last_id)s" not in self._query_text():
+            messagebox.showwarning(title, "Query must contain %(last_id)s")
+            return False
+        if "LIMIT" in self._query_text().upper():
+            messagebox.showwarning(title, "SQL Server query must use TOP (%(batch_size)s), not LIMIT.")
+            return False
+        return True
+
+    def _write_install_config(self) -> Path:
+        local_cfg = ROOT / "config" / "config.ini"
+        local_cfg.parent.mkdir(parents=True, exist_ok=True)
+        (ROOT / "data").mkdir(parents=True, exist_ok=True)
+        self._write_bridge_config(local_cfg)
+        return local_cfg
+
+    def _wait_service_state(self, loops: int = 40) -> str:
+        state = "not installed"
+        for _ in range(loops):
+            time.sleep(0.4)
+            state = self._service_state()
+            if "RUNNING" in state.upper() or "STOPPED" in state.upper():
+                break
+        return state
+
+    def _log_install_result(self, bat: Path | None) -> None:
+        paths = [ROOT / "data" / "install-all-result.txt", ROOT / "data" / "service-install-result.txt"]
+        if bat is not None:
+            paths.insert(0, bat.parent / "data" / "install-all-result.txt")
+        seen: set[str] = set()
+        for path in paths:
+            key = str(path).lower()
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                self.log(text)
+
+    def _finish_service_install(self, title: str, state: str) -> None:
+        ok = "RUNNING" in state.upper() or "STOPPED" in state.upper()
+        if ok:
+            set_ui_at_login(True)
+            self.log("Setup UI at login enabled.")
+            self.after(
+                0,
+                lambda: messagebox.showinfo(
+                    title,
+                    f"PLCBridge installed successfully.\n\nStatus: {state}\n"
+                    "Starts automatically after Windows reboot.",
+                ),
+            )
+        else:
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    title,
+                    "Install did not complete.\n"
+                    "If UAC was cancelled, try again and click Yes.",
+                ),
+            )
+        self.after(0, self.refresh_status)
+
+    def install_all(self) -> None:
+        """VC++ runtime + CP2102 driver + Windows service, from files next to this EXE."""
+        if not self._validate_install_inputs("Install All"):
+            return
+        bat = find_install_all_bat()
+        if not bat:
+            messagebox.showerror(
+                "Install All",
+                "Install-All.bat not found.\nKeep it next to PLCBridgeSetup.exe (USB pack) "
+                "or under tools\\ in the repo.",
             )
             return
-        script = ROOT / "service" / "install-service.ps1"
-        elevate = ROOT / "service" / "elevate-install.ps1"
-        if not script.is_file() or not elevate.is_file():
-            messagebox.showerror("Service", f"Missing install scripts under:\n{ROOT / 'service'}")
-            return
-        if not self.var_db_user.get().strip() or not self.var_db_name.get().strip():
-            messagebox.showwarning("Service", "Fill MySQL settings first, then Check MySQL.")
-            return
-        if "%(last_id)s" not in self._query_text():
-            messagebox.showwarning("Service", "MySQL Query must contain %(last_id)s")
+        if not messagebox.askyesno(
+            "Install All",
+            "Windows will show a UAC prompt — click Yes.\n\n"
+            "This installs everything from this folder (no internet):\n"
+            "  • Visual C++ x86 runtime\n"
+            "  • CP2102 USB driver\n"
+            "  • PLCBridge Windows service (auto-start)\n\n"
+            "Continue?",
+        ):
             return
 
+        def run() -> None:
+            try:
+                cfg = self._write_install_config()
+                self.log(f"Prepared config: {cfg}")
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Config write failed: {exc}")
+                self.after(0, lambda: messagebox.showerror("Install All", f"Config write failed:\n{exc}"))
+                return
+            self.log("Install All: VC++ + CP2102 + service… confirm UAC with Yes.")
+            code, out = elevate_and_wait(bat, "/nopause")
+            if out.strip():
+                self.log(out.strip())
+            if code != 0:
+                self.log(f"Installer exit {code}")
+            self._log_install_result(bat)
+            state = self._wait_service_state()
+            self.log(f"Service state: {state}")
+            self._finish_service_install("Install All", state)
+
+        self._worker(run)
+
+    def install_service(self) -> None:
+        if not self._validate_install_inputs("Install Service"):
+            return
         if not messagebox.askyesno(
             "Install Service",
             "Windows will show a UAC prompt — click Yes.\n\n"
@@ -1841,92 +2360,88 @@ backup_count = 3
         ):
             return
 
+        bat = find_install_all_bat()
+        script = ROOT / "service" / "install-service.ps1"
+        elevate = ROOT / "service" / "elevate-install.ps1"
+
         def run() -> None:
-            local_cfg = ROOT / "config" / "config.ini"
-            result_file = ROOT / "data" / "service-install-result.txt"
             try:
-                local_cfg.parent.mkdir(parents=True, exist_ok=True)
-                (ROOT / "data").mkdir(parents=True, exist_ok=True)
-                self._write_bridge_config(local_cfg)
+                local_cfg = self._write_install_config()
                 self.log(f"Prepared config: {local_cfg}")
-                if result_file.is_file():
-                    result_file.unlink()
             except Exception as exc:  # noqa: BLE001
                 self.log(f"Config write failed: {exc}")
                 self.after(0, lambda: messagebox.showerror("Service", f"Config write failed:\n{exc}"))
                 return
 
-            setup_exe = resolve_setup_exe()
-            cmd = [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(elevate),
-                "-InstallScript",
-                str(script),
-                "-ExePath",
-                str(exe),
-                "-ConfigSource",
-                str(local_cfg),
-                "-ResultFile",
-                str(result_file),
-            ]
-            if setup_exe and setup_exe.suffix.lower() == ".exe":
-                cmd.extend(["-SetupExePath", str(setup_exe)])
-
-            self.log("Installing service… confirm UAC with Yes.")
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"Elevation failed: {exc}")
-                self.after(0, lambda: messagebox.showerror("Service", f"Elevation failed:\n{exc}"))
-                return
-
-            # Wait until Windows reports the service.
-            state = "not installed"
-            for _ in range(30):
-                time.sleep(0.4)
-                state = self._service_state()
-                if "RUNNING" in state.upper() or "STOPPED" in state.upper():
-                    break
-
-            if result_file.is_file():
-                self.log(result_file.read_text(encoding="utf-8", errors="replace").strip())
-            self.log(f"Service state: {state}")
-
-            ok = "RUNNING" in state.upper() or "STOPPED" in state.upper()
-            if ok:
-                set_ui_at_login(True)
-                self.log("Setup UI at login enabled.")
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Service",
-                        f"PLCBridge installed successfully.\n\nStatus: {state}\n"
-                        "Starts automatically after Windows reboot.",
-                    ),
-                )
+            if bat:
+                self.log("Installing service… confirm UAC with Yes.")
+                code, out = elevate_and_wait(bat, "/nopause /service-only")
+                if out.strip():
+                    self.log(out.strip())
+                if code != 0:
+                    self.log(f"Installer exit {code}")
+                self._log_install_result(bat)
+            elif script.is_file() and elevate.is_file():
+                exe = resolve_bridge_exe()
+                result_file = ROOT / "data" / "service-install-result.txt"
+                if result_file.is_file():
+                    result_file.unlink()
+                setup_exe = resolve_setup_exe()
+                cmd = [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(elevate),
+                    "-InstallScript",
+                    str(script),
+                    "-ExePath",
+                    str(exe),
+                    "-ConfigSource",
+                    str(local_cfg),
+                    "-ResultFile",
+                    str(result_file),
+                ]
+                if setup_exe and setup_exe.suffix.lower() == ".exe":
+                    cmd.extend(["-SetupExePath", str(setup_exe)])
+                self.log("Installing service… confirm UAC with Yes.")
+                try:
+                    subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"Elevation failed: {exc}")
+                    self.after(0, lambda: messagebox.showerror("Service", f"Elevation failed:\n{exc}"))
+                    return
+                self._log_install_result(None)
             else:
                 self.after(
                     0,
                     lambda: messagebox.showerror(
                         "Service",
-                        "Install did not complete.\n"
-                        "If UAC was cancelled, try again and click Yes.\n"
-                        "Or run dist\\Install-Service.bat",
+                        "Missing Install-All.bat and service\\install-service.ps1.",
                     ),
                 )
-            self.after(0, self.refresh_status)
+                return
+
+            state = self._wait_service_state()
+            self.log(f"Service state: {state}")
+            self._finish_service_install("Service", state)
 
         self._worker(run)
 
     def uninstall_service(self) -> None:
+        bat = find_uninstall_bat()
         script = ROOT / "service" / "remove-service.ps1"
         elevate = ROOT / "service" / "elevate-uninstall.ps1"
-        if not script.is_file() or not elevate.is_file():
-            messagebox.showerror("Uninstall", f"Missing scripts under:\n{ROOT / 'service'}")
+        if not bat and (not script.is_file() or not elevate.is_file()):
+            messagebox.showerror("Uninstall", "Missing Uninstall-Service.bat and service\\remove-service.ps1.")
             return
 
         if self._service_state().lower().startswith("not installed"):
@@ -1951,30 +2466,37 @@ backup_count = 3
                     pass
 
             self.log("Uninstalling service… confirm UAC with Yes.")
-            try:
-                subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(elevate),
-                        "-RemoveScript",
-                        str(script),
-                        "-ResultFile",
-                        str(result_file),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"Uninstall elevation failed: {exc}")
-                self.after(0, lambda: messagebox.showerror("Uninstall", str(exc)))
-                return
+            if bat:
+                code, out = elevate_and_wait(bat, "/nopause")
+                if out.strip():
+                    self.log(out.strip())
+                if code != 0:
+                    self.log(f"Uninstall exit {code}")
+            else:
+                try:
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(elevate),
+                            "-RemoveScript",
+                            str(script),
+                            "-ResultFile",
+                            str(result_file),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"Uninstall elevation failed: {exc}")
+                    self.after(0, lambda: messagebox.showerror("Uninstall", str(exc)))
+                    return
 
             state = "not installed"
             for _ in range(20):
@@ -2019,64 +2541,6 @@ backup_count = 3
         ok, detail = set_ui_at_login(False)
         self.log("Setup UI at login disabled." if ok else f"Disable failed: {detail}")
         self.refresh_status()
-
-    def open_factory_tools(self) -> None:
-        """Launch offline CP2102 + PlatformIO installer when present."""
-        offline = [
-            ROOT / "tools" / "offline" / "Install-Offline.bat",
-            Path(sys.executable).resolve().parent / "tools" / "offline" / "Install-Offline.bat",
-        ]
-        script = next((p for p in offline if p.is_file()), None)
-        online = [
-            ROOT / "tools" / "Install-CP2102-and-PlatformIO.ps1",
-            ROOT / "dist" / "tools" / "Install-CP2102-and-PlatformIO.ps1",
-            Path(sys.executable).resolve().parent / "tools" / "Install-CP2102-and-PlatformIO.ps1",
-        ]
-        online_script = next((p for p in online if p.is_file()), None)
-
-        msg = (
-            "Factory PC tools:\n"
-            "  • CP2102 driver (local files under tools\\offline\\cp2102)\n"
-            "  • Portable PlatformIO + ESP32 toolchains (offline pack)\n\n"
-            "Prefer OFFLINE installer (no internet).\n"
-        )
-        if script:
-            msg += f"\nLaunch?\n{script}"
-            if messagebox.askyesno("CP2102 + PlatformIO (offline)", msg):
-                try:
-                    subprocess.Popen(["cmd", "/c", str(script)], cwd=str(script.parent))
-                    self.log(f"Opened offline installer: {script}")
-                except OSError as exc:
-                    messagebox.showerror("Tools", str(exc))
-            return
-
-        if online_script:
-            msg += (
-                "\nOffline pack not found on this USB.\n"
-                "On a PC with internet run tools\\offline\\Prepare-OfflinePack.ps1 first.\n\n"
-                f"Open online helper instead?\n{online_script}"
-            )
-            if messagebox.askyesno("CP2102 + PlatformIO", msg):
-                subprocess.Popen(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(online_script),
-                    ]
-                )
-            return
-
-        messagebox.showinfo(
-            "CP2102 + PlatformIO",
-            "No installer found. Copy tools\\offline from the prepared USB stick.",
-        )
-        try:
-            webbrowser.open("https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers")
-        except Exception:  # noqa: BLE001
-            pass
 
     def start_service(self) -> None:
         def run() -> None:

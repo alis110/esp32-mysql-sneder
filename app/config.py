@@ -14,11 +14,14 @@ class ConfigurationError(ValueError):
 @dataclass(frozen=True)
 class DatabaseConfig:
     enabled: bool
+    engine: str
+    auth: str
     host: str
     port: int
     database: str
     username: str
     password: str
+    odbc_driver: str
     query: str
     id_column: str
     batch_size: int
@@ -62,12 +65,53 @@ def default_config_path() -> Path:
             return service_path
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd()
     local = base / "config" / "config.ini"
-    return local if local.is_file() else base / "config" / "config.example.ini"
+    if local.is_file():
+        return local
+    wincc = base / "config" / "config.wincc.ini"
+    return wincc if wincc.is_file() else base / "config" / "config.example.ini"
 
 
 def _resolve_path(raw: str, config_path: Path) -> Path:
     expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
     return expanded if expanded.is_absolute() else (config_path.parent / expanded).resolve()
+
+
+def normalize_engine(raw: str) -> str:
+    value = (raw or "sqlserver").strip().lower()
+    aliases = {
+        "sqlserver": "sqlserver",
+        "sql server": "sqlserver",
+        "mssql": "sqlserver",
+        "mssqlserver": "sqlserver",
+        "wincc": "sqlserver",
+    }
+    if value in {"mysql", "mariadb"}:
+        raise ConfigurationError("MySQL is not supported. Use SQL Server (WinCC Tag Logging) with Windows auth.")
+    engine = aliases.get(value)
+    if engine is None:
+        raise ConfigurationError(f"Unknown database engine: {raw}")
+    return engine
+
+
+def normalize_auth(raw: str, engine: str) -> str:
+    value = (raw or "").strip().lower()
+    if not value:
+        return "windows"
+    aliases = {
+        "sql": "sql",
+        "sqlserver": "sql",
+        "password": "sql",
+        "user": "sql",
+        "windows": "windows",
+        "trusted": "windows",
+        "integrated": "windows",
+        "sspi": "windows",
+        "win": "windows",
+    }
+    auth = aliases.get(value)
+    if auth is None:
+        raise ConfigurationError(f"Unknown database auth: {raw}")
+    return auth
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -91,6 +135,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if enabled and "%(last_id)s" not in query:
         raise ConfigurationError("Query must contain the %(last_id)s parameter")
 
+    engine = normalize_engine(db.get("engine", "sqlserver"))
+    auth = normalize_auth(db.get("auth", ""), engine)
+    default_port = 0
+    default_host = ".\\WINCC"
+
     vid_pid = tuple(
         item.strip().upper() for item in serial.get("vid_pid", "10C4:EA60").split(",") if item.strip()
     )
@@ -98,11 +147,14 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         path=config_path,
         database=DatabaseConfig(
             enabled=enabled,
-            host=db.get("host", "127.0.0.1"),
-            port=db.getint("port", 3306),
-            database=db.get("database", ""),
+            engine=engine,
+            auth=auth,
+            host=db.get("host", default_host).strip() or default_host,
+            port=db.getint("port", default_port),
+            database=db.get("database", "").strip(),
             username=db.get("username", ""),
             password=db.get("password", ""),
+            odbc_driver=db.get("odbc_driver", "").strip(),
             query=query,
             id_column=db.get("id_column", "id").strip(),
             batch_size=db.getint("batch_size", 100),
@@ -130,4 +182,6 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ConfigurationError("batch_size must be at least 1")
     if not result.database.id_column:
         raise ConfigurationError("id_column may not be empty")
+    if enabled and engine == "sqlserver" and "LIMIT" in query.upper():
+        raise ConfigurationError("SQL Server queries must use TOP (%(batch_size)s), not LIMIT")
     return result

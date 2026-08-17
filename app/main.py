@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .config import AppConfig, load_config
-from .database import MySQLSource
+from .database import create_source
 from .logger import configure_logging
 from .serial_bridge import DeliveryError, SerialBridge
 from .state import StateStore
@@ -19,7 +19,7 @@ class BridgeApplication:
         self.stop_event = stop_event or threading.Event()
         self.logger = configure_logging(config.runtime)
         self.state = StateStore(config.runtime.state_db)
-        self.source = MySQLSource(config.database)
+        self.source = create_source(config.database)
         self.serial = SerialBridge(config.serial, self.logger)
 
     def _wait(self, seconds: float) -> bool:
@@ -64,6 +64,7 @@ class BridgeApplication:
                     self._wait(self.config.runtime.retry_delay_seconds)
         finally:
             self.serial.close()
+            self.source.close()
             self.state.close()
             self.logger.info("PLCBridge stopped")
 

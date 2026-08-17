@@ -71,7 +71,12 @@ system-install/firmware/include/secrets.h
 tools/offline/ucrt-x86/*.dll
 
 Roshan/bak_restore/
+Roshan/*.xlsx
+Roshan/*.docx
+Roshan/archive_blocks.csv
+Roshan/._*
 *.bak
+*.msu
 .idea/
 .vscode/
 *.swp

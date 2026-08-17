@@ -53,7 +53,7 @@ def main() -> None:
         win32serviceutil.HandleCommandLine(PLCBridgeService)
         return
 
-    parser = argparse.ArgumentParser(description="PLC MySQL to ESP32 bridge")
+    parser = argparse.ArgumentParser(description="PLC WinCC/SQL Server to ESP32 bridge")
     parser.add_argument("--config", help="Path to config.ini (console mode)")
     parser.add_argument("--console", action="store_true", help="Run interactively instead of as a service")
     args = parser.parse_args()

@@ -1,0 +1,8 @@
+32-bit Universal C Runtime files for Windows 7.
+
+Copied from C:\Windows\SysWOW64\downlevel (api-ms-win-crt-*.dll)
+and C:\Windows\SysWOW64\ucrtbase.dll on a Windows 10 PC.
+
+These must sit next to PLCBridge.exe and PLCBridgeSetup.exe.
+Windows 7 does not include api-ms-win-crt-runtime-l1-1-0.dll until KB2999226.
+The factory PC is offline, so the DLLs travel with the USB pack.
