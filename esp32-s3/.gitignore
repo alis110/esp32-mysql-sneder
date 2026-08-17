@@ -1,0 +1,9 @@
+.pio/
+.vscode/
+helper/__pycache__/
+*.pyc
+AlisBoardHelper.exe
+pack/AlisBoard.exe
+firmware/include/msc_image.h
+helper/*.obj
+helper/*.exe

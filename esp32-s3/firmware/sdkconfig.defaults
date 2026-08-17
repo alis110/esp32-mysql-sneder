@@ -1,0 +1,3 @@
+# Keep USB MSC stable (Wi-Fi + brownout can reset the chip on some cables/ports)
+CONFIG_ESP32S3_BROWNOUT_DET=n
+CONFIG_ESP_MAIN_TASK_WATCHDOG_TIMEOUT_S=30

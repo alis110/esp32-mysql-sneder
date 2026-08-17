@@ -1,0 +1,59 @@
+name: alisboard
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: alisboard-mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: lab
+      MYSQL_DATABASE: mill
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-plab"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: alisboard-api
+    container_name: alisboard-api
+    ports:
+      - "80:80"
+      - "18773:80"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "80"
+      API_TOKEN: lab-token
+      DATA_DIR: /data
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: lab
+    volumes:
+      - ./data:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  adminer:
+    image: adminer:4
+    container_name: alisboard-adminer
+    ports:
+      - "8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

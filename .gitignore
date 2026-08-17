@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.venv38-x86/
+.py38-win32/
+_win7build/
 venv/
 *.egg-info/
 .pytest_cache/
@@ -12,12 +15,31 @@ config/config.ini
 firmware/include/secrets.h
 data/*
 !data/.gitkeep
+lab/receiver/data/
+Roshan/sql-data/
 logs/
 *.log
 
 # Build junk (keep .spec and dist EXEs for ready-to-run Windows use)
 build/
 firmware/.pio/
+esp32-s3/firmware/.pio/
+esp32-s3/firmware/include/msc_image.h
+esp32-s3/helper/*.obj
+esp32-s3/pack/AlisBoard.exe
+esp32-s3/pack/*.res
+esp32-s3/pack/firmware-bin/
+esp32-s3/pack/QUEUE.JSON
+esp32-s3/pack/IN.JSON
+esp32-s3/pack/OUT.JSON
+lab/factory-sim/*.iso
+lab/factory-sim/vm-media/*.bak
+lab/factory-sim/vm-media/*.exe
+Roshan/**/*.mdf
+Roshan/**/*.ldf
+*.iso
+*.mdf
+*.ldf
 
 # Offline factory packs (large ~1GB+ toolchains; keep on USB, rebuild with Prepare-OfflinePack.ps1)
 tools/offline/portable-python/
@@ -34,7 +56,22 @@ dist/logs/
 dist/config/config.ini
 dist/firmware/include/secrets.h
 
-# Editor / OS
+# Factory USB pack binaries (README/bats stay tracked)
+system-install/*.exe
+system-install/drivers/
+system-install/firmware-bin/
+system-install/vcredist/
+system-install/updates/
+system-install/*.dll
+system-install/ucrt-x86/
+system-install/config/config.ini
+system-install/firmware/include/secrets.h
+
+# Win7 UCRT DLLs (copied from SysWOW64\downlevel)
+tools/offline/ucrt-x86/*.dll
+
+Roshan/bak_restore/
+*.bak
 .idea/
 .vscode/
 *.swp

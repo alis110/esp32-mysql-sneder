@@ -1,0 +1,22 @@
+AlisBoard — manual flash (ESP32-S3 DevKit, port USB / USB-OTG)
+
+Problem: "No serial data received" = chip is NOT in download mode.
+Holding BOOT alone is NOT enough. You must also press RESET (EN).
+
+Steps (do exactly in this order):
+
+1. In Windows: eject / Safely Remove the AlisBoard USB disk if it appears.
+2. Close anything using COM8 (Serial Monitor, etc.).
+3. Hold the BOOT button (keep holding).
+4. While still holding BOOT, press and release RESET (EN) once.
+5. Keep holding BOOT. Run:  flash-manual.bat
+6. When you see "Connecting..." or "Writing...", release BOOT.
+
+If COM8 fails, after step 4 check Device Manager:
+  - Ports (COM & LPT) — maybe a new COM port
+  - or "USB JTAG/serial debug unit"
+Then run:  pio run -t upload --upload-port COMx   (replace COMx)
+
+Cable: must be a DATA USB cable (not charge-only). Use the board USB / USB-OTG port.
+
+If it still fails: unplug USB, hold BOOT, plug USB in, wait 3 seconds, release BOOT, run flash-manual.bat immediately.

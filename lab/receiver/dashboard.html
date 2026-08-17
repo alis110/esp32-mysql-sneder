@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AlisBoard mill</title>
+<style>
+  :root {
+    --bg: #0c111b;
+    --panel: #141b28;
+    --line: #243044;
+    --text: #e8eef7;
+    --muted: #8b9bb4;
+    --accent: #3dd6c6;
+    --ok: #3ecf8e;
+    --warn: #e7b549;
+    --sel: #1a3d3a;
+    --hover: #1c2636;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 "Segoe UI", Tahoma, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .02em; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .pulse { color: var(--ok); font-size: 12px; font-weight: 600; }
+  .layout {
+    display: grid;
+    grid-template-columns: 220px 220px minmax(0, 1fr) 340px;
+    height: calc(100vh - 57px);
+  }
+  @media (max-width: 1100px) {
+    .layout { grid-template-columns: 1fr; height: auto; }
+    .col { min-height: 240px; max-height: 50vh; }
+  }
+  .col {
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+  .col:last-child { border-right: 0; }
+  .col h2 {
+    margin: 0;
+    padding: 10px 12px;
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .col h2 b { color: var(--text); font-weight: 650; letter-spacing: 0; text-transform: none; font-size: 12px; }
+  .list { overflow: auto; flex: 1; }
+  .item {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--line);
+  }
+  .item:hover { background: var(--hover); }
+  .item.sel { background: var(--sel); }
+  .item .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .c { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px; flex-shrink: 0; }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  .table-wrap { overflow: auto; flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    white-space: nowrap;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+    color: var(--muted);
+    font-weight: 650;
+  }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--hover); }
+  tbody tr.sel { background: var(--sel); }
+  .empty { color: var(--muted); padding: 24px 14px; }
+  .event {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .event:hover { background: var(--hover); }
+  .event.sel { background: var(--sel); }
+  .event .when { color: var(--muted); font-size: 11px; }
+  .event .sum { margin-top: 3px; }
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid #1f5f58;
+    border-radius: 999px;
+    padding: 1px 7px;
+    margin-right: 6px;
+  }
+  .tag.dup { color: var(--warn); border-color: #6b5420; }
+  .detail {
+    border-top: 1px solid var(--line);
+    max-height: 42%;
+    overflow: auto;
+    padding: 12px;
+    font: 12px/1.5 Consolas, ui-monospace, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0b1018;
+  }
+  .key { color: #7dd3fc; }
+  .str { color: #86efac; }
+  .num { color: #fde68a; }
+  .nul { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>AlisBoard mill</h1>
+    <div class="sub" id="backend">MySQL replica</div>
+  </div>
+  <div class="pulse" id="live">listening</div>
+</header>
+<div class="layout">
+  <div class="col" style="background:var(--panel)">
+    <h2>Databases <b id="dbCount">0</b></h2>
+    <div class="list" id="dbList"><div class="empty">Waiting for crawl…</div></div>
+  </div>
+  <div class="col" style="background:var(--panel)">
+    <h2>Tables <b id="tableTitle"></b></h2>
+    <div class="list" id="tableList"><div class="empty">Select a database</div></div>
+  </div>
+  <div class="col">
+    <h2>Rows <b id="rowTitle"></b></h2>
+    <div class="toolbar">
+      <span id="pageInfo">—</span>
+      <span style="flex:1"></span>
+      <button type="button" id="prevBtn">Prev</button>
+      <button type="button" id="nextBtn">Next</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead id="thead"></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="detail empty" id="rowDetail">Click a row for full columns</div>
+  </div>
+  <div class="col" style="background:var(--panel)">
+    <h2>Arrivals <span>ESP / PC</span> <button type="button" id="clearEvents">Clear</button></h2>
+    <div class="list" id="events"><div class="empty">No posts yet</div></div>
+    <div class="detail empty" id="eventDetail">Click an arrival to see the JSON</div>
+  </div>
+</div>
+<script>
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function syntax(obj) {
+  const json = JSON.stringify(obj, null, 2);
+  return json.replace(/("(?:\\.|[^"\\])*")\s*:/g, '<span class="key">$1</span>:')
+    .replace(/:\s*("(?:\\.|[^"\\])*")/g, ': <span class="str">$1</span>')
+    .replace(/:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g, ': <span class="num">$1</span>')
+    .replace(/:\s*(true|false)/g, ': <span class="num">$1</span>')
+    .replace(/:\s*(null)/g, ': <span class="nul">$1</span>');
+}
+const state = { dbs: [], db: null, table: null, offset: 0, limit: 80, preview: null, row: null, event: null };
+function renderDbs() {
+  const el = document.getElementById('dbList');
+  document.getElementById('dbCount').textContent = state.dbs.length;
+  if (!state.dbs.length) { el.innerHTML = '<div class="empty">No replica databases yet</div>'; return; }
+  el.innerHTML = state.dbs.map(d => {
+    const n = (d.tables || []).reduce((a, t) => a + (t.rows || 0), 0);
+    return `<div class="item ${d.name===state.db?'sel':''}" data-db="${esc(d.name)}">
+      <span class="n" title="${esc(d.name)}">${esc(d.name)}</span>
+      <span class="c">${n}</span>
+    </div>`;
+  }).join('');
+}
+function renderTables() {
+  const el = document.getElementById('tableList');
+  const db = state.dbs.find(d => d.name === state.db);
+  document.getElementById('tableTitle').textContent = state.db || '';
+  if (!db) { el.innerHTML = '<div class="empty">Select a database</div>'; return; }
+  if (!(db.tables || []).length) { el.innerHTML = '<div class="empty">No tables</div>'; return; }
+  el.innerHTML = db.tables.map(t => `<div class="item ${t.name===state.table?'sel':''}" data-table="${esc(t.name)}">
+    <span class="n">${esc(t.name)}</span><span class="c">${t.rows}</span>
+  </div>`).join('');
+}
+function renderPreview() {
+  const p = state.preview;
+  const thead = document.getElementById('thead');
+  const tbody = document.getElementById('tbody');
+  document.getElementById('rowTitle').textContent = p ? (p.database + '.' + p.table) : '';
+  if (!p || !p.ok) {
+    thead.innerHTML = '';
+    tbody.innerHTML = `<tr><td class="empty">${p && p.error ? esc(p.error) : 'Select a table'}</td></tr>`;
+    document.getElementById('pageInfo').textContent = '—';
+    return;
+  }
+  const cols = p.columns || [];
+  thead.innerHTML = '<tr>' + cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr>';
+  tbody.innerHTML = (p.rows || []).map((row, i) => {
+    const sel = state.row === i ? 'sel' : '';
+    return `<tr class="${sel}" data-i="${i}">` + cols.map(c => `<td title="${esc(row[c])}">${esc(row[c])}</td>`).join('') + '</tr>';
+  }).join('') || '<tr><td class="empty" colspan="99">Empty table</td></tr>';
+  const from = p.total ? (p.offset + 1) : 0;
+  const to = Math.min(p.offset + (p.rows || []).length, p.total);
+  document.getElementById('pageInfo').textContent = from + '–' + to + ' of ' + p.total;
+  if (state.row != null && p.rows[state.row]) {
+    document.getElementById('rowDetail').className = 'detail';
+    document.getElementById('rowDetail').innerHTML = syntax(p.rows[state.row]);
+  } else {
+    document.getElementById('rowDetail').className = 'detail empty';
+    document.getElementById('rowDetail').textContent = 'Click a row for full columns';
+  }
+}
+function renderEvents(items) {
+  const el = document.getElementById('events');
+  if (!items.length) { el.innerHTML = '<div class="empty">No posts yet</div>'; return; }
+  el.innerHTML = items.map((e, i) => `<div class="event ${state.event===i?'sel':''}" data-i="${i}">
+    <div class="when">${esc(e.at)} · ${esc(e.ip)}</div>
+    <div class="sum"><span class="tag ${e.duplicate?'dup':''}">${esc(e.kind)}${e.duplicate?' dup':''}</span>${esc(e.summary)}</div>
+  </div>`).join('');
+  window._events = items;
+}
+async function loadTable() {
+  if (!state.db || !state.table) { state.preview = null; state.row = null; renderPreview(); return; }
+  const keep = state.row;
+  const u = `/api/table?db=${encodeURIComponent(state.db)}&table=${encodeURIComponent(state.table)}&limit=${state.limit}&offset=${state.offset}`;
+  state.preview = await fetch(u).then(r => r.json());
+  state.row = (keep != null && state.preview && state.preview.rows && state.preview.rows[keep]) ? keep : null;
+  renderPreview();
+}
+document.getElementById('dbList').addEventListener('click', (e) => {
+  const it = e.target.closest('[data-db]');
+  if (!it) return;
+  state.db = it.getAttribute('data-db');
+  state.table = null;
+  state.preview = null;
+  state.offset = 0;
+  renderDbs(); renderTables(); renderPreview();
+});
+document.getElementById('tableList').addEventListener('click', (e) => {
+  const it = e.target.closest('[data-table]');
+  if (!it) return;
+  state.table = it.getAttribute('data-table');
+  state.offset = 0;
+  renderTables();
+  loadTable();
+});
+document.getElementById('tbody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr[data-i]');
+  if (!tr) return;
+  state.row = Number(tr.getAttribute('data-i'));
+  renderPreview();
+});
+document.getElementById('events').addEventListener('click', (e) => {
+  const it = e.target.closest('[data-i]');
+  if (!it) return;
+  state.event = Number(it.getAttribute('data-i'));
+  const ev = (window._events || [])[state.event];
+  renderEvents(window._events || []);
+  const box = document.getElementById('eventDetail');
+  if (!ev) return;
+  box.className = 'detail';
+  box.innerHTML = syntax(ev.envelope || ev);
+});
+document.getElementById('prevBtn').addEventListener('click', () => {
+  state.offset = Math.max(0, state.offset - state.limit);
+  loadTable();
+});
+document.getElementById('nextBtn').addEventListener('click', () => {
+  const p = state.preview;
+  if (p && state.offset + state.limit < p.total) {
+    state.offset += state.limit;
+    loadTable();
+  }
+});
+document.getElementById('clearEvents').addEventListener('click', async () => {
+  await fetch('/api/events/clear', { method: 'POST' });
+  state.event = null;
+  window._events = [];
+  renderEvents([]);
+  const box = document.getElementById('eventDetail');
+  box.className = 'detail empty';
+  box.textContent = 'Click an arrival to see the JSON';
+});
+async function tick() {
+  try {
+    const s = await fetch('/api/status').then(r => r.json());
+    const ev = await fetch('/api/events?limit=80').then(r => r.json());
+    document.getElementById('backend').textContent = (s.replica && s.replica.backend) || s.backend || '';
+    document.getElementById('live').textContent = s.last_post
+      ? (s.last_post.duplicate ? 'duplicate POST' : 'receiving')
+      : 'listening';
+    state.dbs = (s.replica && s.replica.databases) || [];
+    if (state.db && !state.dbs.some(d => d.name === state.db)) state.db = null;
+    renderDbs();
+    renderTables();
+    renderEvents(ev.events || []);
+    if (state.db && state.table) loadTable();
+  } catch (e) {
+    document.getElementById('live').textContent = 'offline';
+  }
+}
+tick();
+setInterval(tick, 2500);
+</script>
+</body>
+</html>
