@@ -8,14 +8,14 @@ import struct
 from pathlib import Path
 
 IN_SIZE = 2048
-OUT_SIZE = 4096
+OUT_SIZE = 8192
 QUEUE_SIZE = 8192
 SECTOR = 512
 
-START_HERE = """AlisBoard
+START_HERE = """AlisBoard 1.0.1
 
 1. Double-click OPEN.bat (or AlisBoard.exe). Keep it running.
-2. Use Open browser only if you want http://127.0.0.1:48123
+2. Do not wait for a browser. The window is the app.
 3. Closing the window hides it. Use Exit to stop.
 4. Nothing is installed on Windows. SQL uses Windows Authentication (no password).
 5. Optional: set ESP32-S3 factory Wi-Fi for API upload.
@@ -107,7 +107,14 @@ def build(exe: Path | None) -> tuple[bytes, dict]:
         files,
         "OPEN    BAT",
         "OPEN.bat",
-        b"@echo off\r\nstart \"\" \"%~dp0AlisBoard.exe\"\r\n",
+        b"@echo off\r\n"
+        b"REM Do not cd - Win7 cmd cannot use UNC paths like \\\\host\\g\r\n"
+        b"if not exist \"%~dp0AlisBoard.exe\" (\r\n"
+        b"  echo AlisBoard.exe not found next to OPEN.bat\r\n"
+        b"  pause\r\n"
+        b"  exit /b 1\r\n"
+        b")\r\n"
+        b"start \"\" \"%~dp0AlisBoard.exe\"\r\n",
     )
     add_file(files, "IN      JSO", "IN.JSON", b"{}" + b" " * (IN_SIZE - 2))
     add_file(files, "OUT     JSO", "OUT.JSON", b'{"ok":true}' + b" " * (OUT_SIZE - 11))

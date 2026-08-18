@@ -21,6 +21,7 @@ from replica import (
     replica_overview,
     table_preview,
     wait_for_mysql,
+    wipe_all,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR") or (Path(__file__).resolve().parent / "data"))
@@ -32,6 +33,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 _LOCK = threading.Lock()
 _LAST_POST: dict | None = None
 _EVENTS: list[dict] = []
+_INGEST_DOWN = False
 DASH_PATH = Path(__file__).with_name("dashboard.html")
 
 
@@ -66,6 +68,21 @@ def recent_events(limit: int = 80) -> list[dict]:
 def clear_events() -> None:
     with _LOCK:
         _EVENTS.clear()
+
+
+def wipe_everything() -> dict:
+    global _LAST_POST, _INGEST_DOWN
+    with _LOCK:
+        _INGEST_DOWN = True
+    result = wipe_all()
+    with _LOCK:
+        DB.execute("DELETE FROM records")
+        DB.commit()
+        _EVENTS.clear()
+        _LAST_POST = None
+    result["records_cleared"] = True
+    result["ingest_paused"] = True
+    return result
 
 
 def connect() -> sqlite3.Connection:
@@ -163,12 +180,14 @@ def stats() -> dict:
             "SELECT COUNT(DISTINCT tag_name) FROM records WHERE tag_name != ''"
         ).fetchone()[0]
         last_post = _LAST_POST
+        ingest_down = _INGEST_DOWN
     out = {
         "ok": True,
         "total": total,
         "unique_tags": tags,
         "last": None,
         "last_post": last_post,
+        "ingest_paused": ingest_down,
         "replica": replica_overview(),
         "cursors": list_cursors(),
         "backend": backend_name(),
@@ -306,16 +325,36 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        global _INGEST_DOWN
         path = urlparse(self.path).path.rstrip("/") or "/"
         if path == "/api/events/clear":
             clear_events()
             self._send(200, {"ok": True})
+            return
+        if path == "/api/ingest/stop":
+            with _LOCK:
+                _INGEST_DOWN = True
+            self._send(200, {"ok": True, "ingest_paused": True})
+            return
+        if path == "/api/ingest/start":
+            with _LOCK:
+                _INGEST_DOWN = False
+            self._send(200, {"ok": True, "ingest_paused": False})
+            return
+        if path == "/api/wipe":
+            self._send(200, wipe_everything())
             return
         if path not in ("/api/plc-records", "/api/plc-record", "/api/sql-sync"):
             self._send(404, {"ok": False, "error": "not_found"})
             return
         if not self._auth_ok():
             self._send(401, {"ok": False, "error": "unauthorized"})
+            return
+        with _LOCK:
+            paused = _INGEST_DOWN
+        if paused:
+            push_event("stop", self.client_address[0], "HTTP 500 ingest stopped", {"error": "ingest_stopped"})
+            self._send(500, {"ok": False, "error": "ingest_stopped"})
             return
         length = int(self.headers.get("Content-Length", "0"))
         if length > 8_000_000:

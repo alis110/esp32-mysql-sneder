@@ -38,10 +38,17 @@ Win7 VM on Hyper-V Default Switch must use the **host** IP, not `127.0.0.1` insi
 http://172.21.80.1:18773/api/plc-records
 ```
 
-If the VM or ESP cannot connect, elevated PowerShell:
+ESP on mill Wi-Fi (Local LAN) uses the laptop Wi-Fi IP, e.g.:
+
+```text
+http://192.168.100.18:18773/api/plc-records
+```
+
+`up.bat` starts **lan_relay.py** so Wi-Fi/LAN clients reach Docker (Docker Desktop on Windows only reliably serves localhost). If the VM or ESP cannot connect, elevated PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\open-firewall-80.ps1
+powershell -ExecutionPolicy Bypass -File .\test-lan.ps1
 ```
 
 ## Dashboard

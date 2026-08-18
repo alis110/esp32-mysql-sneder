@@ -1,7 +1,7 @@
-AlisBoard
+AlisBoard 1.0.1
 
 1. Double-click OPEN.bat (or AlisBoard.exe). Keep it running.
-2. Use Open browser only if you want http://127.0.0.1:48123
+2. Do not wait for a browser. The window is the app.
 3. Closing the window hides it. Use Exit to stop.
 4. Nothing is installed on Windows. SQL uses Windows Authentication (no password).
 5. Optional: set ESP32-S3 factory Wi-Fi for API upload.

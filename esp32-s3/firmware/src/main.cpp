@@ -28,6 +28,9 @@ uint32_t bootMs = 0;
 bool wifiStarted = false;
 bool httpStarted = false;
 bool wifiLoggedUp = false;
+bool wifiHelloQueued = false;
+String pendingBody;
+int64_t pendingId = 0;
 String lastOutBody;
 int64_t lastId = 0;
 bool lastHelperOk = false;
@@ -59,9 +62,9 @@ void collectLogs(JsonArray arr) {
   for (uint8_t i = 0; i < n; i++) arr.add(logs[(start + i) % 80]);
 }
 
-void connectWifi() {
-  String ssid = getPref("wifi_ssid", "");
-  String pass = getPref("wifi_pass", "");
+void connectWifi(const String &ssidOverride = "", const String &passOverride = "") {
+  String ssid = ssidOverride.length() ? ssidOverride : getPref("wifi_ssid", "");
+  String pass = passOverride.length() ? passOverride : getPref("wifi_pass", "");
   if (!ssid.length()) {
     addLog("Wi-Fi: no SSID saved");
     return;
@@ -133,12 +136,21 @@ void ensureWifiRadio() {
 void applyHost(JsonDocument &doc) {
   const char *cmd = doc["command"] | "";
   if (!strcmp(cmd, "set_wifi")) {
-    if (doc["ssid"].is<const char *>()) prefs.putString("wifi_ssid", doc["ssid"].as<String>());
-    if (doc["password"].is<const char *>()) prefs.putString("wifi_pass", doc["password"].as<String>());
-    if (doc["api_url"].is<const char *>()) prefs.putString("api_url", doc["api_url"].as<String>());
-    if (doc["api_token"].is<const char *>()) prefs.putString("api_token", doc["api_token"].as<String>());
+    String ssid = doc["ssid"] | "";
+    String pass = doc["password"] | "";
+    String url = doc["api_url"] | "";
+    String tok = doc["api_token"] | "";
+    ssid.trim();
+    pass.trim();
+    url.trim();
+    tok.trim();
+    prefs.putString("wifi_ssid", ssid);
+    prefs.putString("wifi_pass", pass);
+    if (url.length()) prefs.putString("api_url", url);
+    if (tok.length()) prefs.putString("api_token", tok);
+    addLog(ssid.length() ? ("Wi-Fi SSID saved: " + ssid) : "Wi-Fi command with empty SSID");
     ensureWifiRadio();
-    connectWifi();
+    connectWifi(ssid, pass);
     addLog("Wi-Fi/API from AlisBoard.exe");
   } else if (!strcmp(cmd, "start_ap")) {
     ensureWifiRadio();
@@ -158,6 +170,13 @@ int httpPost(const String &url, const String &body, const String &auth, String &
   if (!http.begin(client, url)) return -1;
   http.addHeader("Content-Type", "application/json");
   if (auth.length()) http.addHeader("Authorization", auth);
+  int k = body.indexOf("\"idempotency_key\"");
+  if (k >= 0) {
+    int c = body.indexOf(':', k);
+    int q1 = body.indexOf('"', c);
+    int q2 = body.indexOf('"', q1 + 1);
+    if (q1 >= 0 && q2 > q1) http.addHeader("Idempotency-Key", body.substring(q1 + 1, q2));
+  }
   int code = http.POST(body);
   response = http.getString();
   http.end();
@@ -204,23 +223,48 @@ bool callHelper(const char *command, const char *queryId, int64_t afterId, JsonD
   return ok;
 }
 
-void postBody(const String &body, int64_t id) {
+bool postBody(const String &body, int64_t id) {
+  pendingBody = body;
+  pendingId = id;
   String url = getPref("api_url", API_DEFAULT_URL);
   String token = getPref("api_token", API_DEFAULT_TOKEN);
   String auth = token.length() ? ("Bearer " + token) : "";
   String resp;
   int code = httpPost(url, body, auth, resp);
   lastApiOk = code >= 200 && code < 300;
-  lastApiDetail = String(code);
+  if (code > 0)
+    lastApiDetail = String(code);
+  else if (code == HTTPC_ERROR_CONNECTION_REFUSED)
+    lastApiDetail = "refused";
+  else if (code == HTTPC_ERROR_CONNECTION_LOST)
+    lastApiDetail = "lost";
+  else if (code == HTTPC_ERROR_SEND_HEADER_FAILED)
+    lastApiDetail = "send";
+  else
+    lastApiDetail = String(code);
   if (lastApiOk) {
+    bool sqlSync = body.indexOf("\"sql_sync\"") >= 0;
+    pendingBody = "";
+    pendingId = 0;
     if (id > 0) {
       lastId = id;
       prefs.putLong64("last_id", lastId);
     }
-    addLog(String("sent id=") + id);
-  } else {
-    addLog("API fail " + lastApiDetail);
+    if (sqlSync)
+      addLog("sql_sync POST ok");
+    else
+      addLog(String("sent id=") + id);
+    return true;
   }
+  {
+    String host = url;
+    int p = host.indexOf("://");
+    if (p >= 0) host = host.substring(p + 3);
+    p = host.indexOf('/');
+    if (p >= 0) host = host.substring(0, p);
+    addLog("API fail " + lastApiDetail + " " + host + " - retry in 5s");
+  }
+  return false;
 }
 
 void postRow(JsonObjectConst row) {
@@ -240,15 +284,24 @@ void postRow(JsonObjectConst row) {
 }
 
 void writeStatusFile() {
-  if (mscHostMounted()) return;
   JsonDocument doc;
+  String logjoin;
+  uint8_t take = logCount > 12 ? 12 : logCount;
+  uint8_t start = (uint8_t)((logHead + 80 - take) % 80);
   doc["ok"] = true;
+  doc["ver"] = ALISBOARD_VERSION;
   doc["wifi_ok"] = WiFi.status() == WL_CONNECTED;
   doc["wifi_ip"] = WiFi.localIP().toString();
   doc["wifi_ssid"] = getPref("wifi_ssid", "");
   doc["api_ok"] = lastApiOk;
   doc["api_detail"] = lastApiDetail;
+  doc["api_url"] = getPref("api_url", API_DEFAULT_URL);
   doc["sql_connected"] = lastSqlOk;
+  for (uint8_t i = 0; i < take; i++) {
+    if (i) logjoin += " | ";
+    logjoin += logs[(start + i) % 80];
+  }
+  doc["esp_log"] = logjoin;
   String body;
   serializeJson(doc, body);
   if (body == lastOutBody) return;
@@ -257,21 +310,37 @@ void writeStatusFile() {
 }
 
 void drainQueue() {
-  if (millis() - lastDrainMs < 20000) return;
-  String queued;
-  if (!mscTakeQueue(queued)) return;
-  if (queued.length() > 1500) {
-    addLog("ESP skip large queue (PC does backfill)");
-    lastDrainMs = millis();
-    return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  {
+    String queued;
+    if (mscTakeQueue(queued)) {
+      if (queued.length() > 7800) {
+        addLog("ESP queue too large - shrink SQL batch on PC");
+        lastDrainMs = millis();
+        return;
+      }
+      if (queued.indexOf("\"sql_sync\"") >= 0) addLog("sql_sync from PC queue");
+      pendingBody = queued;
+      pendingId = 0;
+    }
   }
-  if (queued.indexOf("\"sql_sync\"") >= 0) {
-    addLog("ESP skip sql_sync (PC crawl)");
-    lastDrainMs = millis();
-    return;
+
+  if (!pendingBody.length() && !wifiHelloQueued) {
+    pendingBody =
+        "{\"type\":\"data\",\"id\":0,\"idempotency_key\":\"esp-wifi-hello\","
+        "\"payload\":{\"TagName\":\"ESP.Hello\",\"RealValue\":\"wifi\"}}";
+    pendingId = 0;
+    wifiHelloQueued = true;
+    addLog("ESP Wi-Fi hello queued");
   }
+
+  uint32_t gap = pendingBody.length() ? API_RETRY_MS : 20000;
+  if (millis() - lastDrainMs < gap) return;
+  if (!pendingBody.length()) return;
+
   lastDrainMs = millis();
-  postBody(queued, 0);
+  postBody(pendingBody, pendingId);
   lastHelperOk = true;
   lastSqlOk = true;
 }
@@ -396,7 +465,8 @@ void setup() {
   lastId = prefs.getLong64("last_id", 0);
 
   addLog("AlisBoard " + String(ALISBOARD_VERSION));
-  addLog("USB MSC only — run AlisBoard.exe on drive G:");
+  addLog("USB MSC only - run AlisBoard.exe on this disk");
+  writeStatusFile();
 }
 
 void loop() {
@@ -413,10 +483,10 @@ void loop() {
       addLog("Wi-Fi lost - scanning again");
       connectWifi();
     }
-    if (millis() - lastOutMs >= OUT_UPDATE_INTERVAL_MS) {
-      lastOutMs = millis();
-      writeStatusFile();
-    }
+  }
+  if (millis() - lastOutMs >= OUT_UPDATE_INTERVAL_MS) {
+    lastOutMs = millis();
+    writeStatusFile();
   }
 
   inboxDoc.clear();

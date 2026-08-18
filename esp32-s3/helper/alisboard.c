@@ -29,21 +29,23 @@
 #include "webui_win.h"
 
 #define APP_NAME "AlisBoard"
+#define APP_VER "1.0.3"
 #define LISTEN_PORT 48123
 #define BROWSER_URL "http://127.0.0.1:48123"
 #define POLL_MS 4000
 #define BACKFILL_MS 80
 #define CURSOR_MAX 400
 #define IN_SIZE 2048
-#define OUT_SIZE 4096
+#define OUT_SIZE 8192
 #define QUEUE_SIZE 8192
 #define JSON_MAX 12000
 #define POST_MAX 48000
-#define LOG_MAX 4000
+#define LOG_MAX 12000
 #define SYNC_BATCH 8
 #define WM_APP_LOG (WM_APP + 1)
 #define WM_APP_SQL (WM_APP + 2)
 #define WM_APP_CFG (WM_APP + 3)
+#define WM_APP_ESP (WM_APP + 4)
 
 #define IDC_USER 101
 #define IDC_SQL 102
@@ -62,6 +64,9 @@
 #define IDC_COPY_LOG 115
 #define IDC_HDR 116
 #define IDC_CLEAR_LOG 117
+#define IDC_ESP_LOG 118
+#define IDC_CLEAR_ESP 119
+#define IDC_COPY_ESP 120
 
 static const char *Q_TLG =
     "SELECT TOP (1) "
@@ -71,7 +76,7 @@ static const char *Q_TLG =
     "WHERE CAST(DATEDIFF(second, '19700101', u.TimeStamp) AS bigint) * 1000 + u.MS > %s "
     "ORDER BY u.TimeStamp ASC, u.MS ASC, u.ValueID ASC";
 
-static HWND g_hwnd, g_log;
+static HWND g_hwnd, g_log, g_esp_log;
 static char g_dir[MAX_PATH];
 static char g_user[128];
 static char g_sql_status[256] = "SQL: connecting...";
@@ -79,9 +84,9 @@ static char g_esp_status[256] = "ESP: USB disk / COM...";
 static char g_after_id[32] = "0";
 static char g_server[128] = ".\\WINCC";
 static char g_database[128] = "all";
-static char g_ssid[64] = "";
-static char g_pass[64] = "";
-static char g_api[192] = "http://127.0.0.1:18773/api/plc-records";
+static char g_ssid[64] = "Alis";
+static char g_pass[64] = "Ali.s1380";
+static char g_api[192] = "http://192.168.100.18:18773/api/plc-records";
 static char g_token[80] = "lab-token";
 static char g_log_ring[LOG_MAX];
 static int g_log_ring_len = 0;
@@ -93,8 +98,13 @@ static volatile int g_http_ready = 0;
 static long long g_last_id = 0;
 
 static int write_padded(const char *name, const char *json, int size);
+static int read_out_json(char *out, int n);
+static const char *json_str(const char *js, const char *key, char *out, int n);
+static int esp_queue_post(const char *json, char *err, int en);
 static void serial_write_line(const char *json);
 static void write_in_json_wifi(void);
+static void json_esc(char *dst, int n, const char *src);
+static void sync_gui_to_globals(void);
 static void json_esc(char *dst, int n, const char *src);
 
 static void logf(const char *fmt, ...) {
@@ -110,6 +120,12 @@ static void logf(const char *fmt, ...) {
     snprintf(line, sizeof(line), "%02d:%02d:%02d %s", st.wHour, st.wMinute, st.wSecond, buf);
     linelen = (int)strlen(line);
     EnterCriticalSection(&g_lock);
+    if (g_log_ring_len + linelen + 2 >= LOG_MAX) {
+        int drop = LOG_MAX / 2;
+        if (drop > g_log_ring_len) drop = g_log_ring_len;
+        memmove(g_log_ring, g_log_ring + drop, (size_t)(g_log_ring_len - drop));
+        g_log_ring_len -= drop;
+    }
     if (g_log_ring_len + linelen + 2 < LOG_MAX) {
         if (g_log_ring_len) {
             g_log_ring[g_log_ring_len++] = '\n';
@@ -146,6 +162,50 @@ static void apply_globals_to_gui(void) {
     SetDlgItemTextA(g_hwnd, IDC_PASS, g_pass);
     SetDlgItemTextA(g_hwnd, IDC_API, g_api);
     SetDlgItemTextA(g_hwnd, IDC_TOKEN, g_token);
+}
+
+static void trim_cr(char *s) {
+    int n = (int)strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
+        s[--n] = 0;
+    }
+}
+
+static void load_ini(void) {
+    char path[MAX_PATH], line[384];
+    FILE *f;
+    snprintf(path, sizeof(path), "%s\\alisboard.ini", g_dir);
+    f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof(line), f)) {
+        trim_cr(line);
+        if (!strncmp(line, "api=", 4))
+            snprintf(g_api, sizeof(g_api), "%s", line + 4);
+        else if (!strncmp(line, "ssid=", 5))
+            snprintf(g_ssid, sizeof(g_ssid), "%s", line + 5);
+        else if (!strncmp(line, "pass=", 5))
+            snprintf(g_pass, sizeof(g_pass), "%s", line + 5);
+        else if (!strncmp(line, "token=", 6))
+            snprintf(g_token, sizeof(g_token), "%s", line + 6);
+        else if (!strncmp(line, "server=", 7))
+            snprintf(g_server, sizeof(g_server), "%s", line + 7);
+        else if (!strncmp(line, "database=", 9))
+            snprintf(g_database, sizeof(g_database), "%s", line + 9);
+    }
+    fclose(f);
+}
+
+static void save_ini(void) {
+    char path[MAX_PATH];
+    FILE *f;
+    sync_gui_to_globals();
+    snprintf(path, sizeof(path), "%s\\alisboard.ini", g_dir);
+    f = fopen(path, "w");
+    if (!f) return;
+    sync_gui_to_globals();
+    fprintf(f, "server=%s\ndatabase=%s\napi=%s\nssid=%s\npass=%s\ntoken=%s\n",
+            g_server, g_database, g_api, g_ssid, g_pass, g_token);
+    fclose(f);
 }
 
 #define IDR_FAVICON 2
@@ -246,182 +306,16 @@ static int parse_http_url(const char *url, char *host, int hn, int *port, char *
     return 1;
 }
 
-static int http_post_json(const char *url, const char *body, const char *token, const char *idem, char *err, int en) {
-    char host[128], path[256], resp[256];
-    int port = 80, blen, n, code = 0;
-    SOCKET s;
-    struct sockaddr_in addr;
-    struct hostent *he;
-    WSADATA wsa;
-    if (!url || !body) {
-        snprintf(err, en, "empty API URL");
-        return 0;
-    }
-    if (_strnicmp(url, "https://", 8) == 0) {
-        snprintf(err, en, "HTTPS needs ESP Wi-Fi; use http:// for this PC");
-        return 0;
-    }
-    if (!parse_http_url(url, host, sizeof(host), &port, path, sizeof(path))) {
-        snprintf(err, en, "bad API URL (need http://host:port/path)");
-        return 0;
-    }
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    he = gethostbyname(host);
-    if (!he || !he->h_addr) {
-        snprintf(err, en, "DNS fail %s", host);
-        return 0;
-    }
-    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        snprintf(err, en, "socket fail");
-        return 0;
-    }
-    {
-        DWORD ms = 5000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&ms, sizeof(ms));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&ms, sizeof(ms));
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    memcpy(&addr.sin_addr, he->h_addr, he->h_length);
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        snprintf(err, en, "connect %s:%d failed", host, port);
-        closesocket(s);
-        return 0;
-    }
-    blen = (int)strlen(body);
-    {
-        int cap = blen + 768;
-        char *req;
-        if (cap < 1024) cap = 1024;
-        req = (char *)HeapAlloc(GetProcessHeap(), 0, cap);
-        if (!req) {
-            snprintf(err, en, "API alloc fail");
-            closesocket(s);
-            return 0;
-        }
-        n = snprintf(req, cap,
-                     "POST %s HTTP/1.0\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
-                     "Authorization: Bearer %s\r\nIdempotency-Key: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-                     path, host, port, token && token[0] ? token : "lab-token",
-                     idem && idem[0] ? idem : "plc-record", blen, body);
-        if (n < 0 || n >= cap) {
-            HeapFree(GetProcessHeap(), 0, req);
-            snprintf(err, en, "API body too large");
-            closesocket(s);
-            return 0;
-        }
-        if (send(s, req, n, 0) != n) {
-            HeapFree(GetProcessHeap(), 0, req);
-            snprintf(err, en, "API send failed");
-            closesocket(s);
-            return 0;
-        }
-        HeapFree(GetProcessHeap(), 0, req);
-    }
-    n = recv(s, resp, sizeof(resp) - 1, 0);
-    closesocket(s);
-    if (n <= 0) {
-        snprintf(err, en, "API no response");
-        return 0;
-    }
-    resp[n] = 0;
-    {
-        char *sp = strchr(resp, ' ');
-        if (sp) code = atoi(sp + 1);
-    }
-    if (code < 200 || code >= 300) {
-        snprintf(err, en, "API HTTP %d", code);
-        return 0;
-    }
-    snprintf(err, en, "HTTP %d", code);
-    return 1;
-}
-
-static int http_get_text(const char *url, const char *token, char *out, int on, char *err, int en) {
-    char host[128], path[256];
-    int port = 80, n, code = 0, got = 0;
-    SOCKET s;
-    struct sockaddr_in addr;
-    struct hostent *he;
-    WSADATA wsa;
-    char req[512];
-    char buf[1024];
-    char *body;
-    out[0] = 0;
-    if (!parse_http_url(url, host, sizeof(host), &port, path, sizeof(path))) {
-        snprintf(err, en, "bad GET URL");
-        return 0;
-    }
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    he = gethostbyname(host);
-    if (!he || !he->h_addr) {
-        snprintf(err, en, "DNS fail");
-        return 0;
-    }
-    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        snprintf(err, en, "socket fail");
-        return 0;
-    }
-    {
-        DWORD ms = 5000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&ms, sizeof(ms));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&ms, sizeof(ms));
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((u_short)port);
-    memcpy(&addr.sin_addr, he->h_addr, he->h_length);
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        snprintf(err, en, "connect fail");
-        closesocket(s);
-        return 0;
-    }
-    n = snprintf(req, sizeof(req),
-                 "GET %s HTTP/1.0\r\nHost: %s:%d\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n",
-                 path, host, port, token && token[0] ? token : "lab-token");
-    if (send(s, req, n, 0) != n) {
-        snprintf(err, en, "GET send fail");
-        closesocket(s);
-        return 0;
-    }
-    while (got < on - 1) {
-        n = recv(s, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        if (got + n > on - 1) n = on - 1 - got;
-        memcpy(out + got, buf, n);
-        got += n;
-        out[got] = 0;
-    }
-    closesocket(s);
-    {
-        char *sp = strchr(out, ' ');
-        if (sp) code = atoi(sp + 1);
-    }
-    if (code < 200 || code >= 300) {
-        snprintf(err, en, "GET HTTP %d", code);
-        out[0] = 0;
-        return 0;
-    }
-    body = strstr(out, "\r\n\r\n");
-    if (body) {
-        body += 4;
-        memmove(out, body, strlen(body) + 1);
-    }
-    snprintf(err, en, "HTTP %d", code);
-    return 1;
-}
-
 static void build_status_json(char *out, int n) {
     char logbuf[LOG_MAX];
     char elog[LOG_MAX * 2];
     char eserver[160], edb[160], ef[280], eapi[240], essid[80], esql[320], eesp[320], euser[160];
     int sql_ok = strstr(g_sql_status, "SQL OK") != NULL;
+    sync_gui_to_globals();
     EnterCriticalSection(&g_lock);
     snprintf(logbuf, sizeof(logbuf), "%s", g_log_ring);
     LeaveCriticalSection(&g_lock);
+    sync_gui_to_globals();
     json_esc(eserver, sizeof(eserver), g_server);
     json_esc(edb, sizeof(edb), g_database);
     json_esc(ef, sizeof(ef), g_dir);
@@ -512,12 +406,65 @@ static int read_out_json(char *out, int n) {
     DWORD rd = 0;
     snprintf(path, sizeof(path), "%s\\OUT.JSON", g_dir);
     h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
+                    FILE_FLAG_NO_BUFFERING, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+    }
     if (h == INVALID_HANDLE_VALUE) return 0;
-    if (!ReadFile(h, out, n - 1, &rd, NULL)) rd = 0;
+    {
+        DWORD want = (DWORD)(((n - 1) / 512) * 512);
+        char *tmp = (char *)VirtualAlloc(NULL, want ? want : 512, MEM_COMMIT, PAGE_READWRITE);
+        if (!tmp) {
+            CloseHandle(h);
+            return 0;
+        }
+        if (!want) want = 512;
+        if (want > (DWORD)n - 1) want = (DWORD)(((n - 1) / 512) * 512);
+        if (!ReadFile(h, tmp, want, &rd, NULL)) rd = 0;
+        if (rd >= (DWORD)n) rd = (DWORD)n - 1;
+        memcpy(out, tmp, rd);
+        VirtualFree(tmp, 0, MEM_RELEASE);
+    }
     CloseHandle(h);
     out[rd] = 0;
     return rd > 0;
+}
+
+static int esp_queue_post(const char *json, char *err, int en) {
+    char out[OUT_SIZE + 512], base_log[1600], new_log[1600];
+    int i;
+    out[0] = base_log[0] = 0;
+    read_out_json(out, sizeof(out));
+    json_str(out, "esp_log", base_log, sizeof(base_log));
+    if (!write_padded("QUEUE.JSON", json, QUEUE_SIZE)) {
+        snprintf(err, en, "QUEUE.JSON write fail");
+        return 0;
+    }
+    logf("SQL batch -> ESP queue (%d bytes), ESP posts via Wi-Fi", (int)strlen(json));
+    for (i = 0; i < 60; i++) {
+        char apio[16], detail[48];
+        Sleep(500);
+        if (!read_out_json(out, sizeof(out))) continue;
+        json_str(out, "esp_log", new_log, sizeof(new_log));
+        if (!strcmp(new_log, base_log)) continue;
+        json_str(out, "api_ok", apio, sizeof(apio));
+        json_str(out, "api_detail", detail, sizeof(detail));
+        if (strstr(new_log, "sql_sync POST ok")) {
+            snprintf(err, en, "HTTP %s via ESP", detail[0] ? detail : "ok");
+            return 1;
+        }
+        if (strstr(new_log, "API fail refused")) {
+            snprintf(err, en, "ESP API refused - on host run lab\\receiver\\up.bat (LAN relay)");
+            return 0;
+        }
+        if (strstr(new_log, "sql_sync from PC queue") && strstr(new_log, "API fail")) {
+            snprintf(err, en, "ESP API %s", detail[0] ? detail : "fail");
+            return 0;
+        }
+    }
+    snprintf(err, en, "ESP timeout - check Wi-Fi and API URL on ESP");
+    return 0;
 }
 
 static const char *pick_driver(void) {
@@ -984,7 +931,7 @@ static void order_new_dbs(DbEnt *ents, int n) {
         if (ents[i].t) dated++;
     if (dated == 0) {
         shuffle_range(ents, 0, n);
-        logf("no dates in DB names — random crawl until newest is found");
+        logf("no dates in DB names - random crawl until newest is found");
     } else {
         if (dated < n) shuffle_range(ents, dated, n);
         logf("crawl oldest-first (%d dated, %d unknown)", dated, n - dated);
@@ -1304,55 +1251,6 @@ static void cursor_set(const char *db, const char *table, const char *after) {
     cursor_save();
 }
 
-static int cursor_pull_api(const char *api, const char *token, int replace) {
-    char url[320], err[128], *line, *next, *tab1, *tab2, *tab3;
-    char *body;
-    int n = 0;
-    if (!api || !api[0]) return 0;
-    {
-        const char *p = strstr(api, "/api/");
-        if (p) snprintf(url, sizeof(url), "%.*s/api/cursors.txt%s", (int)(p - api), api, replace ? "?rebuild=1" : "");
-        else snprintf(url, sizeof(url), "%s", api);
-    }
-    body = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 131072);
-    if (!body) return 0;
-    if (!http_get_text(url, token, body, 131072, err, sizeof(err))) {
-        logf("mill API check failed: %s", err);
-        HeapFree(GetProcessHeap(), 0, body);
-        return 0;
-    }
-    if (replace) g_cn = 0;
-    line = body;
-    while (line && *line) {
-        next = strchr(line, '\n');
-        if (next) *next++ = 0;
-        if (line[0] && line[0] != '\r') {
-            tab1 = strchr(line, '\t');
-            if (tab1) {
-                *tab1++ = 0;
-                tab2 = strchr(tab1, '\t');
-                if (tab2) {
-                    *tab2++ = 0;
-                    tab3 = strchr(tab2, '\t');
-                    if (tab3) *tab3 = 0;
-                    if (line[0] && tab1[0] && tab2[0]) {
-                        cursor_set_mem(line, tab1, tab2);
-                        n++;
-                    }
-                }
-            }
-        }
-        line = next;
-    }
-    cursor_save();
-    if (n)
-        logf("mill already has %d tables — skip those rows, crawl only new data", n);
-    else
-        logf("mill empty — full crawl from oldest databases");
-    HeapFree(GetProcessHeap(), 0, body);
-    return 1;
-}
-
 static int sync_build(SQLHDBC dbc, const char *db, const char *table, const char *after, char *env, int en,
                       char *new_after, int an, int *nrow, char *err, int enerr) {
     SyncCol cols[40];
@@ -1581,7 +1479,7 @@ static DWORD WINAPI http_thread(LPVOID p) {
     }
     listen(ls, 8);
     g_http_ready = 1;
-    logf("Browser (USB, no Wi-Fi): " BROWSER_URL);
+    logf("HTTP ready at " BROWSER_URL " (only after Open browser)");
     while (g_run) {
         SOCKET c = accept(ls, NULL, NULL);
         char req[JSON_MAX], body[JSON_MAX], resp[JSON_MAX], hdr[256];
@@ -1678,21 +1576,19 @@ static void send_wifi(void) {
 static void write_in_json_wifi(void) {
     char js[IN_SIZE];
     char essid[80], epass[80], eapi[220], etok[100];
+    sync_gui_to_globals();
+    if (!g_ssid[0]) {
+        logf("Fill Wi-Fi SSID and password, then Send to ESP32-S3");
+        return;
+    }
     json_esc(essid, sizeof(essid), g_ssid);
     json_esc(epass, sizeof(epass), g_pass);
     json_esc(eapi, sizeof(eapi), g_api);
     json_esc(etok, sizeof(etok), g_token);
-    if (g_ssid[0]) {
-        snprintf(js, sizeof(js),
-                 "{\"command\":\"set_wifi\",\"ssid\":\"%s\",\"password\":\"%s\",\"api_url\":\"%s\",\"api_token\":\"%s\"}",
-                 essid, epass, eapi, etok);
-        logf("ESP will scan for Wi-Fi '%s' then POST API", g_ssid);
-    } else {
-        snprintf(js, sizeof(js),
-                 "{\"command\":\"set_api\",\"url\":\"%s\",\"api_token\":\"%s\"}",
-                 eapi, etok);
-        logf("No Wi-Fi SSID - this PC POSTs to API (ESP radio stays off)");
-    }
+    snprintf(js, sizeof(js),
+             "{\"command\":\"set_wifi\",\"ssid\":\"%s\",\"password\":\"%s\",\"api_url\":\"%s\",\"api_token\":\"%s\"}",
+             essid, epass, eapi, etok);
+    logf("ESP Wi-Fi '%s' -> %s", g_ssid, g_api);
     if (write_padded("IN.JSON", js, IN_SIZE)) logf("Wrote IN.JSON on USB disk");
     else logf("IN.JSON not on this folder (plug ESP disk)");
     serial_write_line(js);
@@ -1717,35 +1613,24 @@ static DWORD WINAPI probe_thread(LPVOID p) {
 static DWORD WINAPI poll_thread(LPVOID p) {
     char dbs[64][128];
     char tables[128][128];
-    int ndb = 0, ntab = 0, live = 0, pass_posts = 0, pulled = 0;
+    int ndb = 0, ntab = 0, live = 0, pass_posts = 0;
     (void)p;
     Sleep(1500);
     cursor_load();
+    logf("SQL crawl -> ESP queue (ESP POSTs to API URL via Wi-Fi)");
     while (g_run) {
-        char server[128], database[128], api[192], token[80], err[256], resolved[128];
-        char after[96], new_after[96], idem[192];
+        char server[128], database[128], err[256], resolved[128];
+        char after[96], new_after[96];
         char *env;
         SQLHENV henv;
         SQLHDBC hdbc;
         int nrow = 0, built, wait_ms;
         gui_get(IDC_SERVER, server, sizeof(server));
         gui_get(IDC_DB, database, sizeof(database));
-        gui_get(IDC_API, api, sizeof(api));
-        gui_get(IDC_TOKEN, token, sizeof(token));
+        sync_gui_to_globals();
         if (!server[0]) snprintf(server, sizeof(server), ".\\WINCC");
         if (!database[0]) snprintf(database, sizeof(database), "all");
-        if (!api[0]) snprintf(api, sizeof(api), "%s", g_api);
-        if (!token[0]) snprintf(token, sizeof(token), "%s", g_token);
-        if (!pulled) {
-            logf("checking mill API for databases/tables already stored...");
-            if (!cursor_pull_api(api, token, 1)) {
-                Sleep(2000);
-                continue;
-            }
-            pulled = 1;
-            g_resume_ok = 1;
-        }
-        env = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, POST_MAX);
+        env = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, QUEUE_SIZE);
         if (!env) {
             Sleep(POLL_MS);
             continue;
@@ -1784,12 +1669,11 @@ static DWORD WINAPI poll_thread(LPVOID p) {
             if (!live && pass_posts == 0) {
                 live = 1;
                 g_itab = 0;
-                logf("crawl done — live newest DBs every 4s, first %s",
+                logf("crawl done - live newest DBs every 4s, first %s",
                      (fill_work_dbs(1, dbs, 64) > 0) ? dbs[0] : "?");
             }
             pass_posts = 0;
             g_idb = 0;
-            cursor_pull_api(api, token, 0);
             if (live) {
                 sql_close(henv, hdbc);
                 LeaveCriticalSection(&g_sql);
@@ -1828,7 +1712,7 @@ static DWORD WINAPI poll_thread(LPVOID p) {
             continue;
         }
         cursor_get(dbs[g_idb], tables[g_itab], after, sizeof(after));
-        built = sync_build(hdbc, dbs[g_idb], tables[g_itab], after, env, POST_MAX, new_after, sizeof(new_after), &nrow,
+        built = sync_build(hdbc, dbs[g_idb], tables[g_itab], after, env, QUEUE_SIZE, new_after, sizeof(new_after), &nrow,
                            err, sizeof(err));
         sql_close(henv, hdbc);
         LeaveCriticalSection(&g_sql);
@@ -1844,36 +1728,55 @@ static DWORD WINAPI poll_thread(LPVOID p) {
             HeapFree(GetProcessHeap(), 0, env);
             continue;
         }
-        snprintf(idem, sizeof(idem), "sql-%s-%s-%s", dbs[g_idb], tables[g_itab], new_after);
-        if (http_post_json(api, env, token, idem, err, sizeof(err))) {
+        if (esp_queue_post(env, err, sizeof(err))) {
             cursor_set(dbs[g_idb], tables[g_itab], new_after);
             pass_posts++;
             logf("%s %s.%s +%d after=%s %s", live ? "live" : "backfill", dbs[g_idb], tables[g_itab], nrow, new_after,
                  err);
             if (nrow < SYNC_BATCH) g_itab++;
+            wait_ms = live ? POLL_MS : BACKFILL_MS;
         } else {
-            logf("PC API fail: %s", err);
+            logf("ESP POST fail: %s - retry in 5s", err);
+            wait_ms = 5000;
         }
         HeapFree(GetProcessHeap(), 0, env);
-        wait_ms = live ? POLL_MS : BACKFILL_MS;
         Sleep(wait_ms);
     }
     return 0;
 }
 
 static DWORD WINAPI out_watch(LPVOID p) {
+    static char last_log[1600];
     (void)p;
+    last_log[0] = 0;
     while (g_run) {
-        char out[OUT_SIZE];
+        char out[OUT_SIZE + 512];
         if (read_out_json(out, sizeof(out)) && out[0] == '{') {
-            char ip[40] = "", ssid[64] = "";
+            char ip[40] = "", ssid[64] = "", wifio[12] = "", apio[12] = "", detail[48] = "", esplog[1600] = "";
             json_str(out, "wifi_ip", ip, sizeof(ip));
             json_str(out, "wifi_ssid", ssid, sizeof(ssid));
+            json_str(out, "wifi_ok", wifio, sizeof(wifio));
+            json_str(out, "api_ok", apio, sizeof(apio));
+            json_str(out, "api_detail", detail, sizeof(detail));
+            json_str(out, "esp_log", esplog, sizeof(esplog));
             if (ip[0] && strcmp(ip, "0.0.0.0"))
-                snprintf(g_esp_status, sizeof(g_esp_status), "ESP: Wi-Fi %s  %s", ip, ssid);
+                snprintf(g_esp_status, sizeof(g_esp_status), "ESP: Wi-Fi %s  %s  API %s", ip, ssid,
+                         detail[0] ? detail : (apio[0] ? apio : "?"));
+            else if (wifio[0])
+                snprintf(g_esp_status, sizeof(g_esp_status), "ESP: Wi-Fi down  API %s", detail[0] ? detail : "-");
+            if (esplog[0] && strcmp(esplog, last_log) != 0) {
+                char *heap = (char *)HeapAlloc(GetProcessHeap(), 0, strlen(esplog) + 1);
+                snprintf(last_log, sizeof(last_log), "%s", esplog);
+                if (heap && g_hwnd) {
+                    strcpy(heap, esplog);
+                    PostMessage(g_hwnd, WM_APP_ESP, 0, (LPARAM)heap);
+                } else if (heap) {
+                    HeapFree(GetProcessHeap(), 0, heap);
+                }
+            }
         }
         if (g_hwnd) PostMessage(g_hwnd, WM_APP_SQL, 1, 0);
-        Sleep(2000);
+        Sleep(1000);
     }
     return 0;
 }
@@ -1919,12 +1822,12 @@ static HWND ui_group(const char *text, int x, int y, int w, int h) {
     return ui_ctrl("BUTTON", text, BS_GROUPBOX, x, y, w, h, 0, g_font_bold);
 }
 
-static void copy_logs(void) {
+static void copy_edit(HWND edit, const char *okmsg) {
     int len;
     HGLOBAL hg;
     char *buf;
-    if (!g_log) return;
-    len = GetWindowTextLengthA(g_log);
+    if (!edit) return;
+    len = GetWindowTextLengthA(edit);
     if (len <= 0) return;
     hg = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)len + 1);
     if (!hg) return;
@@ -1933,16 +1836,49 @@ static void copy_logs(void) {
         GlobalFree(hg);
         return;
     }
-    GetWindowTextA(g_log, buf, len + 1);
+    GetWindowTextA(edit, buf, len + 1);
     GlobalUnlock(hg);
     if (OpenClipboard(g_hwnd)) {
         EmptyClipboard();
         SetClipboardData(CF_TEXT, hg);
         CloseClipboard();
-        logf("Logs copied to clipboard");
+        logf("%s", okmsg);
     } else {
         GlobalFree(hg);
     }
+}
+
+static void copy_logs(void) { copy_edit(g_log, "PC logs copied"); }
+
+static void set_esp_log_text(const char *joined) {
+    char buf[1800];
+    char clean[1800];
+    int i, j = 0;
+    static char last_shown[1800];
+    if (!g_esp_log || !joined) return;
+    if (!strcmp(joined, last_shown)) return;
+    snprintf(last_shown, sizeof(last_shown), "%s", joined);
+    for (i = 0; joined[i] && j < (int)sizeof(clean) - 2; i++) {
+        unsigned char c = (unsigned char)joined[i];
+        if (c >= 32 && c < 127) clean[j++] = (char)c;
+        else if (c == '\t') clean[j++] = ' ';
+    }
+    clean[j] = 0;
+    joined = clean;
+    j = 0;
+    for (i = 0; joined[i] && j < (int)sizeof(buf) - 3; i++) {
+        if (joined[i] == ' ' && joined[i + 1] == '|' && joined[i + 2] == ' ') {
+            buf[j++] = '\r';
+            buf[j++] = '\n';
+            i += 2;
+        } else {
+            buf[j++] = joined[i];
+        }
+    }
+    buf[j] = 0;
+    SetWindowTextA(g_esp_log, buf);
+    SendMessageA(g_esp_log, EM_SETSEL, (WPARAM)j, (LPARAM)j);
+    SendMessageA(g_esp_log, EM_SCROLLCARET, 0, 0);
 }
 
 static void clear_logs(void) {
@@ -1953,7 +1889,22 @@ static void clear_logs(void) {
     if (g_log) SetWindowTextA(g_log, "");
 }
 
+static volatile int g_http_started;
+
 static void open_browser(void) {
+    if (!g_http_started) {
+        g_http_started = 1;
+        CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
+    }
+    {
+        int i;
+        for (i = 0; i < 40 && !g_http_ready; i++) Sleep(50);
+    }
+    if (!g_http_ready) {
+        logf("HTTP not ready - click Open browser again");
+        return;
+    }
+    logf("Open browser clicked");
     ShellExecuteA(NULL, "open", BROWSER_URL, NULL, NULL, SW_SHOWNORMAL);
 }
 
@@ -1989,35 +1940,41 @@ static void layout(void) {
     ui_ctrl("STATIC", "Database", 0, m + 310, y + 26, 64, 18, 0, g_font_ui);
     ui_ctrl("EDIT", "all", WS_BORDER | ES_AUTOHSCROLL, m + 378, y + 24, 160, 24, IDC_DB, g_font_ui);
     ui_ctrl("BUTTON", "Test SQL", BS_PUSHBUTTON, m + 556, y + 22, 100, 28, IDC_TEST, g_font_ui);
-    ui_ctrl("STATIC", "On start: check mill API, skip stored tables, crawl only new rows (fast). Windows login.", 0,
+    ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs batches to API URL via Wi-Fi (Send to ESP32-S3).", 0,
             m + 16, y + 58, w - 32, 18, 0, g_font_ui);
 
     y = 234;
-    ui_group("Mill API (same JSON as ESP32-S3)", m, y, w, 150);
-    ui_ctrl("STATIC", "SSID", 0, m + 16, y + 26, 56, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, m + 76, y + 24, 220, 24, IDC_SSID, g_font_ui);
-    ui_ctrl("STATIC", "Password", 0, m + 310, y + 26, 64, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 378, y + 24, 160, 24, IDC_PASS, g_font_ui);
-    ui_ctrl("STATIC", "API URL", 0, m + 16, y + 58, 56, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "http://127.0.0.1:18773/api/plc-records", WS_BORDER | ES_AUTOHSCROLL, m + 76, y + 56, 462, 24, IDC_API,
+    ui_group("Mill API + Wi-Fi (ESP over Wi-Fi)", m, y, w, 178);
+    ui_ctrl("STATIC", "API URL", 0, m + 16, y + 26, 88, 18, 0, g_font_ui);
+    ui_ctrl("EDIT", "http://192.168.100.18:18773/api/plc-records", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 24, 430, 24,
+            IDC_API, g_font_ui);
+    ui_ctrl("STATIC", "Token", 0, m + 16, y + 56, 88, 18, 0, g_font_ui);
+    ui_ctrl("EDIT", "lab-token", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 108, y + 54, 180, 24, IDC_TOKEN,
             g_font_ui);
-    ui_ctrl("STATIC", "Token", 0, m + 16, y + 90, 56, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "lab-token", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 76, y + 88, 220, 24, IDC_TOKEN,
-            g_font_ui);
-    ui_ctrl("BUTTON", "Send to ESP32-S3", BS_PUSHBUTTON, m + 310, y + 86, 130, 28, IDC_SEND, g_font_ui);
-    ui_ctrl("BUTTON", "Exit", BS_PUSHBUTTON, m + 452, y + 86, 72, 28, IDC_EXIT, g_font_ui);
-    ui_ctrl("STATIC", "PC crawls SQL (resume from MySQL). ESP Wi-Fi is optional and slow — not for backfill.", 0,
-            m + 16, y + 120, w - 32, 18, 0, g_font_ui);
+    ui_ctrl("STATIC", "Wi-Fi SSID", 0, m + 16, y + 86, 88, 18, 0, g_font_ui);
+    ui_ctrl("EDIT", "Alis", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 84, 180, 24, IDC_SSID, g_font_ui);
+    ui_ctrl("STATIC", "Password", 0, m + 310, y + 86, 64, 18, 0, g_font_ui);
+    ui_ctrl("EDIT", "Ali.s1380", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 378, y + 84, 160, 24, IDC_PASS, g_font_ui);
+    ui_ctrl("BUTTON", "Send to ESP32-S3", BS_PUSHBUTTON, m + 556, y + 80, 130, 28, IDC_SEND, g_font_ui);
+    ui_ctrl("BUTTON", "Exit", BS_PUSHBUTTON, m + 692, y + 80, 52, 28, IDC_EXIT, g_font_ui);
+    ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs to API URL via Wi-Fi. Host firewall must allow port 18773.", 0,
+            m + 16, y + 118, w - 32, 18, 0, g_font_ui);
 
-    y = 394;
-    ui_group("Logs", m, y, w, 228);
-    ui_ctrl("BUTTON", "Clear", BS_PUSHBUTTON, m + w - 200, y + 18, 72, 26, IDC_CLEAR_LOG, g_font_ui);
-    ui_ctrl("BUTTON", "Copy logs", BS_PUSHBUTTON, m + w - 112, y + 18, 96, 26, IDC_COPY_LOG, g_font_ui);
-    ui_ctrl("STATIC", "Select text, Copy logs, or Clear. Scroll with mouse wheel.", 0, m + 16, y + 22, 400, 18, 0,
-            g_font_ui);
+    y = 422;
+    ui_group("PC logs", m, y, 368, 228);
+    ui_ctrl("BUTTON", "Clear", BS_PUSHBUTTON, m + 196, y + 18, 72, 24, IDC_CLEAR_LOG, g_font_ui);
+    ui_ctrl("BUTTON", "Copy", BS_PUSHBUTTON, m + 276, y + 18, 72, 24, IDC_COPY_LOG, g_font_ui);
     g_log = ui_ctrl("EDIT", "", WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP | ES_NOHIDESEL,
-                    m + 12, y + 48, w - 24, 168, IDC_LOG, g_font_log);
+                    m + 12, y + 46, 344, 168, IDC_LOG, g_font_log);
     SendMessageA(g_log, EM_SETLIMITTEXT, LOG_MAX - 1, 0);
+
+    ui_group("ESP32 logs (live)", m + 380, y, 368, 228);
+    ui_ctrl("BUTTON", "Clear", BS_PUSHBUTTON, m + 576, y + 18, 72, 24, IDC_CLEAR_ESP, g_font_ui);
+    ui_ctrl("BUTTON", "Copy", BS_PUSHBUTTON, m + 656, y + 18, 72, 24, IDC_COPY_ESP, g_font_ui);
+    g_esp_log = ui_ctrl("EDIT", "Waiting for ESP OUT.JSON next to this exe...",
+                        WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+                        m + 392, y + 46, 344, 168, IDC_ESP_LOG, g_font_log);
+    SendMessageA(g_esp_log, EM_SETLIMITTEXT, 4000, 0);
 }
 
 static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2025,6 +1982,7 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE:
         g_hwnd = h;
         layout();
+        apply_globals_to_gui();
         CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
         return 0;
     case WM_APP_LOG:
@@ -2052,13 +2010,23 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_CFG:
         apply_globals_to_gui();
         return 0;
+    case WM_APP_ESP:
+        if (l) {
+            set_esp_log_text((const char *)l);
+            HeapFree(GetProcessHeap(), 0, (void *)l);
+        }
+        return 0;
     case WM_COMMAND:
-        if (LOWORD(w) == IDC_TEST) CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
-        if (LOWORD(w) == IDC_SEND) send_wifi();
-        if (LOWORD(w) == IDC_BROWSER) open_browser();
-        if (LOWORD(w) == IDC_COPY_LOG) copy_logs();
-        if (LOWORD(w) == IDC_CLEAR_LOG) clear_logs();
-        if (LOWORD(w) == IDC_EXIT) DestroyWindow(h);
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_BROWSER) open_browser();
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_TEST) CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_SEND) send_wifi();
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_COPY_LOG) copy_logs();
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_CLEAR_LOG) clear_logs();
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_COPY_ESP) copy_edit(g_esp_log, "ESP logs copied");
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_CLEAR_ESP) {
+            if (g_esp_log) SetWindowTextA(g_esp_log, "");
+        }
+        if (HIWORD(w) == BN_CLICKED && l && LOWORD(w) == IDC_EXIT) DestroyWindow(h);
         return 0;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
@@ -2076,15 +2044,19 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLOREDIT:
         SetBkColor((HDC)w, RGB(255, 255, 255));
-        return (INT_PTR)((HWND)l == g_log ? g_brush_log : g_brush_white);
+        return (INT_PTR)((HWND)l == g_log || (HWND)l == g_esp_log ? g_brush_log : g_brush_white);
     case WM_CTLCOLORBTN:
         SetBkColor((HDC)w, GetSysColor(COLOR_BTNFACE));
         return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
     case WM_CLOSE:
         ShowWindow(h, SW_HIDE);
-        logf("Window hidden - browser still at " BROWSER_URL);
+        sync_gui_to_globals();
+        save_ini();
+        logf("Window hidden - use the taskbar or run OPEN.bat again. Exit to stop.");
         return 0;
     case WM_DESTROY:
+        sync_gui_to_globals();
+        save_ini();
         free_ui_resources();
         g_run = 0;
         PostQuitMessage(0);
@@ -2105,6 +2077,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     InitializeCriticalSection(&g_sql);
     windows_user(g_user, sizeof(g_user));
     exe_dir(g_dir, sizeof(g_dir));
+    load_ini();
     init_ui_resources();
     memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = wnd;
@@ -2120,18 +2093,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         SetForegroundWindow(h);
         return 0;
     }
-    h = CreateWindowA(APP_NAME, "AlisBoard - Portable Setup",
-                      WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 40, 40, 796, 680, NULL, NULL, inst, NULL);
+    h = CreateWindowA(APP_NAME, "AlisBoard " APP_VER,
+                      WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 40, 40, 796, 756, NULL, NULL, inst, NULL);
     ShowWindow(h, SW_SHOWNORMAL);
     SetForegroundWindow(h);
     UpdateWindow(h);
-    logf("AlisBoard portable - nothing is installed on Windows");
+    logf("AlisBoard %s - nothing is installed on Windows", APP_VER);
     logf("Windows user: %s", g_user);
     logf("Folder: %s", g_dir);
-    logf("Browser (USB, no Wi-Fi): " BROWSER_URL);
-    CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
-    for (int i = 0; i < 50 && !g_http_ready; i++) Sleep(100);
-    if (!g_http_ready) logf("Browser HTTP not ready - Open browser later");
+    logf("Browser does not open by itself. Use Open browser only if you want it.");
     CreateThread(NULL, 0, serial_thread, NULL, 0, NULL);
     CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
     CreateThread(NULL, 0, out_watch, NULL, 0, NULL);

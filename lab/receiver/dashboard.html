@@ -36,6 +36,10 @@
   header h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .02em; }
   header .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .pulse { color: var(--ok); font-size: 12px; font-weight: 600; }
+  .pulse.stop { color: #f87171; }
+  button.stop-on { border-color: #f87171; color: #f87171; }
+  button.danger { border-color: #f87171; color: #f87171; }
+  button.danger:hover { border-color: #ef4444; color: #fecaca; }
   .layout {
     display: grid;
     grid-template-columns: 220px 220px minmax(0, 1fr) 340px;
@@ -165,7 +169,11 @@
     <h1>AlisBoard mill</h1>
     <div class="sub" id="backend">MySQL replica</div>
   </div>
-  <div class="pulse" id="live">listening</div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <button type="button" id="stopBtn">Stop</button>
+    <button type="button" id="deleteAllBtn" class="danger">Delete all</button>
+    <div class="pulse" id="live">listening</div>
+  </div>
 </header>
 <div class="layout">
   <div class="col" style="background:var(--panel)">
@@ -330,14 +338,58 @@ document.getElementById('clearEvents').addEventListener('click', async () => {
   box.className = 'detail empty';
   box.textContent = 'Click an arrival to see the JSON';
 });
+document.getElementById('stopBtn').addEventListener('click', async () => {
+  const paused = document.getElementById('stopBtn').dataset.paused === '1';
+  await fetch(paused ? '/api/ingest/start' : '/api/ingest/stop', { method: 'POST' });
+  tick();
+});
+document.getElementById('deleteAllBtn').addEventListener('click', async () => {
+  if (!confirm('Delete ALL replica databases, tables, cursors, and arrivals? Ingest pauses until you click Stop again. MySQL volume stays.')) return;
+  const btn = document.getElementById('deleteAllBtn');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/wipe', { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) {
+      alert('Delete failed: ' + (j.error || r.status));
+      return;
+    }
+    state.db = null;
+    state.table = null;
+    state.preview = null;
+    state.row = null;
+    state.event = null;
+    window._events = [];
+    document.getElementById('eventDetail').className = 'detail empty';
+    document.getElementById('eventDetail').textContent = 'Click an arrival to see the JSON';
+    document.getElementById('rows').innerHTML = '';
+    await tick();
+  } catch (e) {
+    alert('Delete failed: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+});
 async function tick() {
   try {
     const s = await fetch('/api/status').then(r => r.json());
     const ev = await fetch('/api/events?limit=80').then(r => r.json());
     document.getElementById('backend').textContent = (s.replica && s.replica.backend) || s.backend || '';
-    document.getElementById('live').textContent = s.last_post
-      ? (s.last_post.duplicate ? 'duplicate POST' : 'receiving')
-      : 'listening';
+    const live = document.getElementById('live');
+    const stopBtn = document.getElementById('stopBtn');
+    if (s.ingest_paused) {
+      live.textContent = 'stopped';
+      live.classList.add('stop');
+      stopBtn.textContent = 'Stop';
+      stopBtn.dataset.paused = '1';
+      stopBtn.classList.add('stop-on');
+    } else {
+      live.classList.remove('stop');
+      live.textContent = 'listening';
+      stopBtn.textContent = 'Stop';
+      stopBtn.dataset.paused = '0';
+      stopBtn.classList.remove('stop-on');
+    }
     state.dbs = (s.replica && s.replica.databases) || [];
     if (state.db && !state.dbs.some(d => d.name === state.db)) state.db = null;
     renderDbs();

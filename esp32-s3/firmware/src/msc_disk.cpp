@@ -150,29 +150,46 @@ void mscBegin() {
 void mscLoop() {}
 
 bool mscTakeInbox(JsonDocument &doc) {
-  if (!inDirty || millis() - inMs < 400) return false;
-  inDirty = false;
+  if (inDirty && millis() - inMs >= 400) {
+    inDirty = false;
+    String js = trimJson(inBuf, sizeof(inBuf));
+    if (!js.length()) return false;
+    if (deserializeJson(doc, js)) return false;
+    memset(inBuf, ' ', sizeof(inBuf));
+    memcpy(inBuf, "{}", 2);
+    return true;
+  }
   String js = trimJson(inBuf, sizeof(inBuf));
-  if (!js.length()) return false;
+  if (js.length() < 12 || js.indexOf("\"command\"") < 0) return false;
+  static String lastIn;
+  if (js == lastIn) return false;
   if (deserializeJson(doc, js)) return false;
-  memset(inBuf, ' ', sizeof(inBuf));
-  memcpy(inBuf, "{}", 2);
+  lastIn = js;
   return true;
 }
 
 bool mscTakeQueue(String &json) {
-  if (!queueDirty || millis() - queueMs < 400) return false;
-  queueDirty = false;
+  if (queueDirty && millis() - queueMs >= 400) {
+    queueDirty = false;
+    json = trimJson(queueBuf, sizeof(queueBuf));
+    memset(queueBuf, ' ', sizeof(queueBuf));
+    memcpy(queueBuf, "{}", 2);
+    return json.length() > 2;
+  }
   json = trimJson(queueBuf, sizeof(queueBuf));
+  if (json.length() <= 2 || json == "{}") return false;
+  if (json.indexOf("sql_sync") < 0 && json.indexOf("\"type\"") < 0) return false;
+  static String lastQueue;
+  if (json == lastQueue) return false;
+  lastQueue = json;
   memset(queueBuf, ' ', sizeof(queueBuf));
   memcpy(queueBuf, "{}", 2);
-  return json.length() > 2;
+  return true;
 }
 
 bool mscHostMounted() { return hostMounted; }
 
 void mscWriteOut(const char *json) {
-  if (hostMounted) return;
   memset(outBuf, ' ', sizeof(outBuf));
   size_t n = strlen(json);
   if (n > sizeof(outBuf) - 1) n = sizeof(outBuf) - 1;

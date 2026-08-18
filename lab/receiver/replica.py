@@ -549,6 +549,63 @@ def replica_overview() -> dict[str, Any]:
     return {"backend": backend_name(), "databases": dbs}
 
 
+_PROTECTED_MYSQL = {"information_schema", "mysql", "performance_schema", "sys"}
+
+
+def wipe_all() -> dict[str, Any]:
+    """Drop every replica database and cursor. Does not touch Docker volumes."""
+    dropped: list[str] = []
+    mysql = _mysql_conn()
+    if mysql:
+        with mysql.cursor() as cur:
+            cur.execute("SHOW DATABASES")
+            names = [r[0] for r in cur.fetchall() if r[0] not in _PROTECTED_MYSQL]
+        for name in names:
+            with mysql.cursor() as cur:
+                cur.execute(f"DROP DATABASE IF EXISTS `{name}`")
+            dropped.append(name)
+        with mysql.cursor() as cur:
+            cur.execute(
+                "CREATE DATABASE IF NOT EXISTS `mill` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            cur.execute(
+                "CREATE DATABASE IF NOT EXISTS `alis_meta` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS `alis_meta`.`cursors` ("
+                "src_database VARCHAR(190) NOT NULL,"
+                "src_table VARCHAR(128) NOT NULL,"
+                "watermark VARCHAR(190) NOT NULL DEFAULT '0',"
+                "row_count BIGINT NOT NULL DEFAULT 0,"
+                "mysql_database VARCHAR(64),"
+                "mysql_table VARCHAR(64),"
+                "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                "PRIMARY KEY (src_database, src_table)"
+                ")"
+            )
+            cur.execute("TRUNCATE TABLE `alis_meta`.`cursors`")
+    with _LOCK:
+        for conn in list(_SQLITE.values()):
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _SQLITE.clear()
+    if REPLICA_DIR.is_dir():
+        catalog = REPLICA_DIR / "_catalog.sqlite3"
+        if catalog.is_file():
+            try:
+                catalog.unlink()
+            except OSError:
+                pass
+        for path in REPLICA_DIR.glob("*.sqlite3"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return {"ok": True, "dropped": dropped, "backend": backend_name()}
+
+
 def table_preview(db_name: str, table_name: str, limit: int = 80, offset: int = 0) -> dict[str, Any]:
     ident_db = mysql_ident(db_name)
     ident_table = mysql_ident(table_name)
