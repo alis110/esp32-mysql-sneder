@@ -29,7 +29,7 @@
 #include "webui_win.h"
 
 #define APP_NAME "AlisBoard"
-#define APP_VER "1.0.3"
+#define APP_VER "1.0.4"
 #define LISTEN_PORT 48123
 #define BROWSER_URL "http://127.0.0.1:48123"
 #define POLL_MS 4000
@@ -67,6 +67,7 @@
 #define IDC_ESP_LOG 118
 #define IDC_CLEAR_ESP 119
 #define IDC_COPY_ESP 120
+#define IDC_API_USED 121
 
 static const char *Q_TLG =
     "SELECT TOP (1) "
@@ -86,8 +87,9 @@ static char g_server[128] = ".\\WINCC";
 static char g_database[128] = "all";
 static char g_ssid[64] = "Alis";
 static char g_pass[64] = "Ali.s1380";
-static char g_api[192] = "http://192.168.100.18:18773/api/plc-records";
+static char g_api[256] = "";
 static char g_token[80] = "lab-token";
+static char g_esp_api_url[256] = "";
 static char g_log_ring[LOG_MAX];
 static int g_log_ring_len = 0;
 static HANDLE g_com = INVALID_HANDLE_VALUE;
@@ -103,6 +105,7 @@ static const char *json_str(const char *js, const char *key, char *out, int n);
 static int esp_queue_post(const char *json, char *err, int en);
 static void serial_write_line(const char *json);
 static void write_in_json_wifi(void);
+static void append_esp_local_line(const char *line);
 static void json_esc(char *dst, int n, const char *src);
 static void sync_gui_to_globals(void);
 static void json_esc(char *dst, int n, const char *src);
@@ -171,6 +174,31 @@ static void trim_cr(char *s) {
     }
 }
 
+static void normalize_api_url(char *url, int n) {
+    char tmp[256];
+    const char *path;
+    int len;
+    if (!url || n < 24) return;
+    trim_cr(url);
+    while (url[0] == ' ' || url[0] == '\t') memmove(url, url + 1, strlen(url) + 1);
+    if (!url[0]) return;
+    if (_strnicmp(url, "https://", 8) == 0) {
+        snprintf(tmp, sizeof(tmp), "http://%s", url + 8);
+        snprintf(url, n, "%s", tmp);
+    } else if (_strnicmp(url, "http://", 7) != 0) {
+        snprintf(tmp, sizeof(tmp), "http://%s", url);
+        snprintf(url, n, "%s", tmp);
+    }
+    path = strchr(url + 7, '/');
+    if (!path) {
+        len = (int)strlen(url);
+        if (len + 18 < n) memcpy(url + len, "/api/plc-records", 17);
+    } else if (path[1] == 0) {
+        snprintf(tmp, sizeof(tmp), "%sapi/plc-records", url);
+        snprintf(url, n, "%s", tmp);
+    }
+}
+
 static void load_ini(void) {
     char path[MAX_PATH], line[384];
     FILE *f;
@@ -193,16 +221,17 @@ static void load_ini(void) {
             snprintf(g_database, sizeof(g_database), "%s", line + 9);
     }
     fclose(f);
+    normalize_api_url(g_api, sizeof(g_api));
 }
 
 static void save_ini(void) {
     char path[MAX_PATH];
     FILE *f;
     sync_gui_to_globals();
+    normalize_api_url(g_api, sizeof(g_api));
     snprintf(path, sizeof(path), "%s\\alisboard.ini", g_dir);
     f = fopen(path, "w");
     if (!f) return;
-    sync_gui_to_globals();
     fprintf(f, "server=%s\ndatabase=%s\napi=%s\nssid=%s\npass=%s\ntoken=%s\n",
             g_server, g_database, g_api, g_ssid, g_pass, g_token);
     fclose(f);
@@ -309,7 +338,7 @@ static int parse_http_url(const char *url, char *host, int hn, int *port, char *
 static void build_status_json(char *out, int n) {
     char logbuf[LOG_MAX];
     char elog[LOG_MAX * 2];
-    char eserver[160], edb[160], ef[280], eapi[240], essid[80], esql[320], eesp[320], euser[160];
+    char eserver[160], edb[160], ef[280], eapi[280], essid[80], esql[320], eesp[320], euser[160], eespapi[280];
     int sql_ok = strstr(g_sql_status, "SQL OK") != NULL;
     sync_gui_to_globals();
     EnterCriticalSection(&g_lock);
@@ -325,13 +354,14 @@ static void build_status_json(char *out, int n) {
     json_esc(esql, sizeof(esql), g_sql_status);
     json_esc(eesp, sizeof(eesp), g_esp_status);
     json_esc(euser, sizeof(euser), g_user);
+    json_esc(eespapi, sizeof(eespapi), g_esp_api_url);
     snprintf(out, n,
              "{\"ok\":true,\"helper\":\"1.0.0\",\"browser_url\":\"" BROWSER_URL "\","
              "\"windows_user\":\"%s\",\"usb_folder\":\"%s\",\"sql_connected\":%s,"
              "\"sql_status\":\"%s\",\"esp_status\":\"%s\",\"server\":\"%s\",\"database\":\"%s\","
-             "\"wifi_ssid\":\"%s\",\"api_url\":\"%s\",\"logs\":\"%s\"}",
+             "\"wifi_ssid\":\"%s\",\"api_url\":\"%s\",\"esp_api_url\":\"%s\",\"logs\":\"%s\"}",
              euser, ef, sql_ok ? "true" : "false", esql, eesp,
-             eserver, edb, essid, eapi, elog);
+             eserver, edb, essid, eapi, eespapi, elog);
 }
 
 static const char *json_str(const char *js, const char *key, char *out, int n) {
@@ -443,27 +473,25 @@ static int esp_queue_post(const char *json, char *err, int en) {
     }
     logf("SQL batch -> ESP queue (%d bytes), ESP posts via Wi-Fi", (int)strlen(json));
     for (i = 0; i < 60; i++) {
-        char apio[16], detail[48];
+        char apio[16], detail[48], used[256];
         Sleep(500);
         if (!read_out_json(out, sizeof(out))) continue;
         json_str(out, "esp_log", new_log, sizeof(new_log));
         if (!strcmp(new_log, base_log)) continue;
         json_str(out, "api_ok", apio, sizeof(apio));
         json_str(out, "api_detail", detail, sizeof(detail));
+        json_str(out, "api_url", used, sizeof(used));
+        if (!used[0]) json_str(out, "api_post_url", used, sizeof(used));
         if (strstr(new_log, "sql_sync POST ok")) {
-            snprintf(err, en, "HTTP %s via ESP", detail[0] ? detail : "ok");
+            snprintf(err, en, "HTTP %s via ESP URL %s", detail[0] ? detail : "ok", used[0] ? used : "?");
             return 1;
         }
-        if (strstr(new_log, "API fail refused")) {
-            snprintf(err, en, "ESP API refused - on host run lab\\receiver\\up.bat (LAN relay)");
-            return 0;
-        }
-        if (strstr(new_log, "sql_sync from PC queue") && strstr(new_log, "API fail")) {
-            snprintf(err, en, "ESP API %s", detail[0] ? detail : "fail");
+        if (strstr(new_log, "API fail refused") || strstr(new_log, "API fail")) {
+            snprintf(err, en, "ESP POST %s URL=%s", detail[0] ? detail : "fail", used[0] ? used : "?");
             return 0;
         }
     }
-    snprintf(err, en, "ESP timeout - check Wi-Fi and API URL on ESP");
+    snprintf(err, en, "ESP timeout - look at ESP API URL line (that is the real destination)");
     return 0;
 }
 
@@ -1570,15 +1598,24 @@ static DWORD WINAPI http_thread(LPVOID p) {
 
 static void send_wifi(void) {
     sync_gui_to_globals();
+    normalize_api_url(g_api, sizeof(g_api));
+    if (g_hwnd) SetDlgItemTextA(g_hwnd, IDC_API, g_api);
+    logf("Box API URL (after normalize): %s", g_api[0] ? g_api : "(empty)");
     write_in_json_wifi();
 }
 
 static void write_in_json_wifi(void) {
     char js[IN_SIZE];
-    char essid[80], epass[80], eapi[220], etok[100];
+    char essid[80], epass[80], eapi[280], etok[100];
     sync_gui_to_globals();
+    normalize_api_url(g_api, sizeof(g_api));
+    if (g_hwnd) SetDlgItemTextA(g_hwnd, IDC_API, g_api);
     if (!g_ssid[0]) {
         logf("Fill Wi-Fi SSID and password, then Send to ESP32-S3");
+        return;
+    }
+    if (!g_api[0]) {
+        logf("Fill API URL (IP or full http://host/api/plc-records), then Send");
         return;
     }
     json_esc(essid, sizeof(essid), g_ssid);
@@ -1586,12 +1623,26 @@ static void write_in_json_wifi(void) {
     json_esc(eapi, sizeof(eapi), g_api);
     json_esc(etok, sizeof(etok), g_token);
     snprintf(js, sizeof(js),
-             "{\"command\":\"set_wifi\",\"ssid\":\"%s\",\"password\":\"%s\",\"api_url\":\"%s\",\"api_token\":\"%s\"}",
-             essid, epass, eapi, etok);
-    logf("ESP Wi-Fi '%s' -> %s", g_ssid, g_api);
-    if (write_padded("IN.JSON", js, IN_SIZE)) logf("Wrote IN.JSON on USB disk");
-    else logf("IN.JSON not on this folder (plug ESP disk)");
+             "{\"command\":\"set_wifi\",\"ssid\":\"%s\",\"password\":\"%s\",\"api_url\":\"%s\",\"api_token\":\"%s\",\"nonce\":%lu}",
+             essid, epass, eapi, etok, (unsigned long)GetTickCount());
+    logf("Sending to ESP: SSID='%s'", g_ssid);
+    logf("Sending to ESP: API URL='%s'", g_api);
+    append_esp_local_line("Send clicked");
+    append_esp_local_line(g_api);
+    /* Fast path: if serial is connected, push command immediately. */
     serial_write_line(js);
+    append_esp_local_line("Serial push sent");
+    if (write_padded("IN.JSON", js, IN_SIZE)) {
+        logf("Wrote IN.JSON with API URL above");
+        append_esp_local_line("IN.JSON write OK");
+        /* Write the same payload again to reduce Windows cache lag (no restart). */
+        Sleep(260);
+        write_padded("IN.JSON", js, IN_SIZE);
+        append_esp_local_line("IN.JSON write repeat OK");
+    } else {
+        logf("IN.JSON not on this folder (plug ESP disk)");
+        append_esp_local_line("IN.JSON write FAIL - plug ESP USB disk");
+    }
 }
 
 static void do_probe(void) {
@@ -1736,7 +1787,9 @@ static DWORD WINAPI poll_thread(LPVOID p) {
             if (nrow < SYNC_BATCH) g_itab++;
             wait_ms = live ? POLL_MS : BACKFILL_MS;
         } else {
-            logf("ESP POST fail: %s - retry in 5s", err);
+            logf("ESP POST fail: %s", err);
+            logf("ESP used URL: %s", g_esp_api_url[0] ? g_esp_api_url : "(unknown)");
+            logf("Box URL: %s", g_api[0] ? g_api : "(empty)");
             wait_ms = 5000;
         }
         HeapFree(GetProcessHeap(), 0, env);
@@ -1753,17 +1806,32 @@ static DWORD WINAPI out_watch(LPVOID p) {
         char out[OUT_SIZE + 512];
         if (read_out_json(out, sizeof(out)) && out[0] == '{') {
             char ip[40] = "", ssid[64] = "", wifio[12] = "", apio[12] = "", detail[48] = "", esplog[1600] = "";
+            char esp_api_url[256] = "", post_url[256] = "";
+            static char last_mismatch[256];
             json_str(out, "wifi_ip", ip, sizeof(ip));
             json_str(out, "wifi_ssid", ssid, sizeof(ssid));
             json_str(out, "wifi_ok", wifio, sizeof(wifio));
             json_str(out, "api_ok", apio, sizeof(apio));
             json_str(out, "api_detail", detail, sizeof(detail));
+            json_str(out, "api_url", esp_api_url, sizeof(esp_api_url));
+            json_str(out, "api_post_url", post_url, sizeof(post_url));
             json_str(out, "esp_log", esplog, sizeof(esplog));
+            if (post_url[0] && strcmp(post_url, "(empty)") != 0)
+                snprintf(g_esp_api_url, sizeof(g_esp_api_url), "%s", post_url);
+            else if (esp_api_url[0])
+                snprintf(g_esp_api_url, sizeof(g_esp_api_url), "%s", esp_api_url);
             if (ip[0] && strcmp(ip, "0.0.0.0"))
                 snprintf(g_esp_status, sizeof(g_esp_status), "ESP: Wi-Fi %s  %s  API %s", ip, ssid,
                          detail[0] ? detail : (apio[0] ? apio : "?"));
             else if (wifio[0])
                 snprintf(g_esp_status, sizeof(g_esp_status), "ESP: Wi-Fi down  API %s", detail[0] ? detail : "-");
+            if (g_api[0] && g_esp_api_url[0] && strcmp(g_api, g_esp_api_url) != 0 &&
+                strcmp(last_mismatch, g_esp_api_url) != 0) {
+                snprintf(last_mismatch, sizeof(last_mismatch), "%s", g_esp_api_url);
+                logf("URL mismatch: box  = %s", g_api);
+                logf("URL mismatch: ESP  = %s  (board POSTs to this one)", g_esp_api_url);
+                logf("Click Send to ESP32-S3 to apply the box URL");
+            }
             if (esplog[0] && strcmp(esplog, last_log) != 0) {
                 char *heap = (char *)HeapAlloc(GetProcessHeap(), 0, strlen(esplog) + 1);
                 snprintf(last_log, sizeof(last_log), "%s", esplog);
@@ -1850,10 +1918,37 @@ static void copy_edit(HWND edit, const char *okmsg) {
 
 static void copy_logs(void) { copy_edit(g_log, "PC logs copied"); }
 
+static int edit_is_near_bottom(HWND edit) {
+    int first, lines, page;
+    RECT rc;
+    if (!edit) return 1;
+    first = (int)SendMessageA(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+    lines = (int)SendMessageA(edit, EM_GETLINECOUNT, 0, 0);
+    GetClientRect(edit, &rc);
+    page = (rc.bottom - rc.top) / 16;
+    if (page < 1) page = 1;
+    return first + page + 1 >= lines;
+}
+
+static void append_esp_local_line(const char *line) {
+    int len, keep_bottom;
+    if (!g_esp_log || !line || !line[0]) return;
+    keep_bottom = edit_is_near_bottom(g_esp_log);
+    len = GetWindowTextLengthA(g_esp_log);
+    SendMessageA(g_esp_log, EM_SETSEL, len, len);
+    SendMessageA(g_esp_log, EM_REPLACESEL, FALSE, (LPARAM)"[HOST] ");
+    SendMessageA(g_esp_log, EM_REPLACESEL, FALSE, (LPARAM)line);
+    SendMessageA(g_esp_log, EM_REPLACESEL, FALSE, (LPARAM)"\r\n");
+    if (keep_bottom) {
+        SendMessageA(g_esp_log, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        SendMessageA(g_esp_log, EM_SCROLLCARET, 0, 0);
+    }
+}
+
 static void set_esp_log_text(const char *joined) {
     char buf[1800];
     char clean[1800];
-    int i, j = 0;
+    int i, j = 0, keep_bottom, first_line;
     static char last_shown[1800];
     if (!g_esp_log || !joined) return;
     if (!strcmp(joined, last_shown)) return;
@@ -1876,9 +1971,19 @@ static void set_esp_log_text(const char *joined) {
         }
     }
     buf[j] = 0;
+    keep_bottom = edit_is_near_bottom(g_esp_log);
+    first_line = (int)SendMessageA(g_esp_log, EM_GETFIRSTVISIBLELINE, 0, 0);
+    SendMessageA(g_esp_log, WM_SETREDRAW, FALSE, 0);
     SetWindowTextA(g_esp_log, buf);
-    SendMessageA(g_esp_log, EM_SETSEL, (WPARAM)j, (LPARAM)j);
-    SendMessageA(g_esp_log, EM_SCROLLCARET, 0, 0);
+    if (keep_bottom) {
+        SendMessageA(g_esp_log, EM_SETSEL, (WPARAM)j, (LPARAM)j);
+        SendMessageA(g_esp_log, EM_SCROLLCARET, 0, 0);
+    } else {
+        SendMessageA(g_esp_log, EM_LINESCROLL, 0, first_line);
+    }
+    SendMessageA(g_esp_log, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_esp_log, NULL, TRUE);
+    UpdateWindow(g_esp_log);
 }
 
 static void clear_logs(void) {
@@ -1909,14 +2014,17 @@ static void open_browser(void) {
 }
 
 static void append_log_line(const char *line) {
-    int len;
+    int len, keep_bottom;
     if (!g_log || !line) return;
+    keep_bottom = edit_is_near_bottom(g_log);
     len = GetWindowTextLengthA(g_log);
     SendMessageA(g_log, EM_SETSEL, len, len);
     SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)line);
     SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)"\r\n");
-    SendMessageA(g_log, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-    SendMessageA(g_log, EM_SCROLLCARET, 0, 0);
+    if (keep_bottom) {
+        SendMessageA(g_log, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        SendMessageA(g_log, EM_SCROLLCARET, 0, 0);
+    }
 }
 
 static void layout(void) {
@@ -1924,30 +2032,32 @@ static void layout(void) {
     const int w = 748;
     int y;
 
-    ui_group("Status", m, 8, w, 112);
+    ui_group("Status", m, 8, w, 138);
     ui_ctrl("BUTTON", "Open browser", BS_PUSHBUTTON, m + w - 142, 24, 130, 28, IDC_BROWSER, g_font_ui);
     ui_ctrl("STATIC", "User:", 0, m + 12, 30, 44, 18, 0, g_font_ui);
     ui_ctrl("STATIC", g_user, 0, m + 58, 30, w - 210, 18, IDC_USER, g_font_ui);
     ui_ctrl("STATIC", "SQL:", 0, m + 12, 54, 44, 18, 0, g_font_ui);
     ui_ctrl("STATIC", g_sql_status, SS_LEFT | SS_NOPREFIX, m + 58, 52, w - 76, 36, IDC_SQL, g_font_ui);
     ui_ctrl("STATIC", "ESP:", 0, m + 12, 94, 44, 18, 0, g_font_ui);
-    ui_ctrl("STATIC", g_esp_status, 0, m + 58, 94, w - 76, 18, IDC_ESP, g_font_ui);
+    ui_ctrl("STATIC", g_esp_status, SS_LEFT | SS_NOPREFIX, m + 58, 94, w - 76, 18, IDC_ESP, g_font_ui);
+    ui_ctrl("STATIC", "ESP API URL", 0, m + 12, 116, 88, 18, 0, g_font_ui);
+    ui_ctrl("EDIT", "(waiting for ESP - this is the real POST URL)",
+            WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, m + 108, 114, w - 122, 22, IDC_API_USED, g_font_ui);
 
-    y = 128;
+    y = 156;
     ui_group("SQL Server (Windows Authentication, no password)", m, y, w, 96);
     ui_ctrl("STATIC", "Server", 0, m + 16, y + 26, 56, 18, 0, g_font_ui);
     ui_ctrl("EDIT", ".\\WINCC", WS_BORDER | ES_AUTOHSCROLL, m + 76, y + 24, 220, 24, IDC_SERVER, g_font_ui);
     ui_ctrl("STATIC", "Database", 0, m + 310, y + 26, 64, 18, 0, g_font_ui);
     ui_ctrl("EDIT", "all", WS_BORDER | ES_AUTOHSCROLL, m + 378, y + 24, 160, 24, IDC_DB, g_font_ui);
     ui_ctrl("BUTTON", "Test SQL", BS_PUSHBUTTON, m + 556, y + 22, 100, 28, IDC_TEST, g_font_ui);
-    ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs batches to API URL via Wi-Fi (Send to ESP32-S3).", 0,
+    ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs batches to the API URL via Wi-Fi after Send.", 0,
             m + 16, y + 58, w - 32, 18, 0, g_font_ui);
 
-    y = 234;
+    y = 262;
     ui_group("Mill API + Wi-Fi (ESP over Wi-Fi)", m, y, w, 178);
     ui_ctrl("STATIC", "API URL", 0, m + 16, y + 26, 88, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "http://192.168.100.18:18773/api/plc-records", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 24, 430, 24,
-            IDC_API, g_font_ui);
+    ui_ctrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 24, 430, 24, IDC_API, g_font_ui);
     ui_ctrl("STATIC", "Token", 0, m + 16, y + 56, 88, 18, 0, g_font_ui);
     ui_ctrl("EDIT", "lab-token", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 108, y + 54, 180, 24, IDC_TOKEN,
             g_font_ui);
@@ -1957,10 +2067,11 @@ static void layout(void) {
     ui_ctrl("EDIT", "Ali.s1380", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 378, y + 84, 160, 24, IDC_PASS, g_font_ui);
     ui_ctrl("BUTTON", "Send to ESP32-S3", BS_PUSHBUTTON, m + 556, y + 80, 130, 28, IDC_SEND, g_font_ui);
     ui_ctrl("BUTTON", "Exit", BS_PUSHBUTTON, m + 692, y + 80, 52, 28, IDC_EXIT, g_font_ui);
-    ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs to API URL via Wi-Fi. Host firewall must allow port 18773.", 0,
-            m + 16, y + 118, w - 32, 18, 0, g_font_ui);
+    ui_ctrl("STATIC",
+            "Type IP or full URL, then Send. ESP API URL above is what the board actually POSTs to.", 0,
+            m + 16, y + 118, w - 32, 36, 0, g_font_ui);
 
-    y = 422;
+    y = 450;
     ui_group("PC logs", m, y, 368, 228);
     ui_ctrl("BUTTON", "Clear", BS_PUSHBUTTON, m + 196, y + 18, 72, 24, IDC_CLEAR_LOG, g_font_ui);
     ui_ctrl("BUTTON", "Copy", BS_PUSHBUTTON, m + 276, y + 18, 72, 24, IDC_COPY_LOG, g_font_ui);
@@ -1979,11 +2090,21 @@ static void layout(void) {
 
 static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_ERASEBKGND: {
+        RECT rc;
+        HDC dc = (HDC)w;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_brush_panel ? g_brush_panel : (HBRUSH)(COLOR_BTNFACE + 1));
+        return 1;
+    }
     case WM_CREATE:
         g_hwnd = h;
         layout();
         apply_globals_to_gui();
         CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
+        return 0;
+    case WM_SIZE:
+        InvalidateRect(h, NULL, TRUE);
         return 0;
     case WM_APP_LOG:
         if (l) {
@@ -2006,6 +2127,7 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         SetDlgItemTextA(h, IDC_ESP, g_esp_status);
         SetDlgItemTextA(h, IDC_USER, g_user);
+        SetDlgItemTextA(h, IDC_API_USED, g_esp_api_url[0] ? g_esp_api_url : "(waiting for ESP - this is the real POST URL)");
         return 0;
     case WM_APP_CFG:
         apply_globals_to_gui();
@@ -2031,6 +2153,18 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
         int id = GetDlgCtrlID((HWND)l);
+        if ((HWND)l == g_log || (HWND)l == g_esp_log) {
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, RGB(248, 250, 252));
+            SetTextColor(dc, RGB(35, 45, 60));
+            return (INT_PTR)g_brush_log;
+        }
+        if (id == IDC_API_USED) {
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, RGB(255, 255, 255));
+            SetTextColor(dc, RGB(55, 65, 85));
+            return (INT_PTR)g_brush_white;
+        }
         SetBkMode(dc, TRANSPARENT);
         if (id == IDC_SQL)
             SetTextColor(dc, strstr(g_sql_status, "SQL OK") ? RGB(0, 130, 70) : RGB(190, 45, 45));
@@ -2040,14 +2174,16 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             SetTextColor(dc, RGB(55, 65, 85));
         else
             SetTextColor(dc, RGB(70, 80, 95));
-        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+        return (INT_PTR)g_brush_panel;
     }
     case WM_CTLCOLOREDIT:
+        SetBkMode((HDC)w, OPAQUE);
         SetBkColor((HDC)w, RGB(255, 255, 255));
-        return (INT_PTR)((HWND)l == g_log || (HWND)l == g_esp_log ? g_brush_log : g_brush_white);
+        SetTextColor((HDC)w, RGB(35, 45, 60));
+        return (INT_PTR)g_brush_white;
     case WM_CTLCOLORBTN:
-        SetBkColor((HDC)w, GetSysColor(COLOR_BTNFACE));
-        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+        SetBkColor((HDC)w, RGB(236, 242, 248));
+        return (INT_PTR)g_brush_panel;
     case WM_CLOSE:
         ShowWindow(h, SW_HIDE);
         sync_gui_to_globals();
@@ -2082,7 +2218,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc = wnd;
     wc.hInstance = inst;
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.hbrBackground = g_brush_panel;
     wc.lpszClassName = APP_NAME;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
@@ -2093,15 +2230,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         SetForegroundWindow(h);
         return 0;
     }
-    h = CreateWindowA(APP_NAME, "AlisBoard " APP_VER,
-                      WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 40, 40, 796, 756, NULL, NULL, inst, NULL);
+    h = CreateWindowExA(WS_EX_COMPOSITED, APP_NAME, "AlisBoard " APP_VER,
+                        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                        40, 40, 796, 790, NULL, NULL, inst, NULL);
     ShowWindow(h, SW_SHOWNORMAL);
     SetForegroundWindow(h);
     UpdateWindow(h);
     logf("AlisBoard %s - nothing is installed on Windows", APP_VER);
     logf("Windows user: %s", g_user);
     logf("Folder: %s", g_dir);
-    logf("Browser does not open by itself. Use Open browser only if you want it.");
+    logf("API URL in this window: %s", g_api[0] ? g_api : "(empty - type IP or full URL then Send)");
+    logf("ESP API URL line shows the address the board actually POSTs to.");
     CreateThread(NULL, 0, serial_thread, NULL, 0, NULL);
     CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
     CreateThread(NULL, 0, out_watch, NULL, 0, NULL);

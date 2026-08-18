@@ -34,6 +34,7 @@ _LOCK = threading.Lock()
 _LAST_POST: dict | None = None
 _EVENTS: list[dict] = []
 _INGEST_DOWN = False
+_HEALTH_HITS: list[dict] = []
 DASH_PATH = Path(__file__).with_name("dashboard.html")
 
 
@@ -68,6 +69,19 @@ def recent_events(limit: int = 80) -> list[dict]:
 def clear_events() -> None:
     with _LOCK:
         _EVENTS.clear()
+
+
+def note_health_hit(ip: str, path: str, ua: str) -> None:
+    item = {"at": utc_now(), "ip": ip, "path": path, "ua": ua}
+    with _LOCK:
+        _HEALTH_HITS.insert(0, item)
+        del _HEALTH_HITS[200:]
+
+
+def recent_health_hits(limit: int = 50) -> list[dict]:
+    limit = max(1, min(limit, 200))
+    with _LOCK:
+        return list(_HEALTH_HITS[:limit])
 
 
 def wipe_everything() -> dict:
@@ -191,6 +205,7 @@ def stats() -> dict:
         "replica": replica_overview(),
         "cursors": list_cursors(),
         "backend": backend_name(),
+        "health_hits": recent_health_hits(20),
     }
     if last:
         out["last"] = {
@@ -291,7 +306,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if result.get("ok") else 404, result)
             return
         if path.path in ("/health", "/api/health"):
+            note_health_hit(
+                self.client_address[0],
+                path.path,
+                self.headers.get("User-Agent", ""),
+            )
             self._send(200, {"ok": True})
+            return
+        if path.path == "/api/health/hits":
+            qs = parse_qs(path.query)
+            limit = int((qs.get("limit") or ["50"])[0])
+            self._send(200, {"ok": True, "hits": recent_health_hits(limit)})
             return
         if path.path == "/api/cursors":
             if not self._auth_ok():

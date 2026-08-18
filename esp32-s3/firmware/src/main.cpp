@@ -36,17 +36,58 @@ int64_t lastId = 0;
 bool lastHelperOk = false;
 bool lastSqlOk = false;
 bool lastApiOk = false;
+bool lastApiHealthOk = false;
 String lastApiDetail = "never";
+String lastApiHealthDetail = "never";
+String lastPostUrl = "-";
+String lastHealthUrl = "-";
+uint32_t lastHealthMs = 0;
+String currentApiUrl;
 String helperUser;
 String helperDb;
 String helperError;
 uint32_t helperReq = 1;
 JsonDocument inboxDoc;
 
+void addLog(const String &line);
+
+void addLog(const String &line);
+
 String getPref(const char *key, const char *fallback) {
   String v = prefs.getString(key, fallback);
   v.trim();
   return v.length() ? v : String(fallback);
+}
+
+String normalizeApiUrl(String url) {
+  url.trim();
+  url.replace('\\', '/');
+  if (!url.length()) return url;
+  if (url.startsWith("https://"))
+    url = String("http://") + url.substring(8);
+  else if (!url.startsWith("http://"))
+    url = String("http://") + url;
+  int slash = url.indexOf('/', 7);
+  if (slash < 0)
+    url += API_DEFAULT_PATH;
+  else if (slash == static_cast<int>(url.length()) - 1)
+    url += String(API_DEFAULT_PATH).substring(1);
+  return url;
+}
+
+String activeApiUrl() {
+  if (currentApiUrl.length()) return normalizeApiUrl(currentApiUrl);
+  return normalizeApiUrl(getPref("api_url", API_DEFAULT_URL));
+}
+
+void saveApiUrl(const String &raw) {
+  String url = normalizeApiUrl(raw);
+  if (url.length()) {
+    currentApiUrl = url;
+    prefs.putString("api_url", url);
+  }
+  lastPostUrl = url.length() ? url : String("(empty)");
+  addLog("API URL saved: " + lastPostUrl);
 }
 
 void addLog(const String &line) {
@@ -146,19 +187,25 @@ void applyHost(JsonDocument &doc) {
     tok.trim();
     prefs.putString("wifi_ssid", ssid);
     prefs.putString("wifi_pass", pass);
-    if (url.length()) prefs.putString("api_url", url);
+    if (!url.length() && doc["url"].is<const char *>()) url = doc["url"].as<String>();
+    url.trim();
+    if (url.length()) saveApiUrl(url);
     if (tok.length()) prefs.putString("api_token", tok);
-    addLog(ssid.length() ? ("Wi-Fi SSID saved: " + ssid) : "Wi-Fi command with empty SSID");
+    addLog("SSID: " + ssid);
+    addLog("API URL in set_wifi: " + activeApiUrl());
     ensureWifiRadio();
     connectWifi(ssid, pass);
-    addLog("Wi-Fi/API from AlisBoard.exe");
+  } else if (!strcmp(cmd, "restart")) {
+    addLog("Restart from host command");
+    delay(300);
+    ESP.restart();
   } else if (!strcmp(cmd, "start_ap")) {
     ensureWifiRadio();
     addLog("Wi-Fi AP started (manual)");
   } else if (!strcmp(cmd, "set_api")) {
-    if (doc["url"].is<const char *>()) prefs.putString("api_url", doc["url"].as<String>());
+    if (doc["url"].is<const char *>()) saveApiUrl(doc["url"].as<String>());
+    else if (doc["api_url"].is<const char *>()) saveApiUrl(doc["api_url"].as<String>());
     if (doc["token"].is<const char *>()) prefs.putString("api_token", doc["token"].as<String>());
-    addLog("API from AlisBoard.exe");
   }
 }
 
@@ -181,6 +228,47 @@ int httpPost(const String &url, const String &body, const String &auth, String &
   response = http.getString();
   http.end();
   return code;
+}
+
+String healthUrlFromApi(const String &apiUrl) {
+  String url = apiUrl;
+  int slash = url.indexOf('/', 7);
+  if (slash > 0) url = url.substring(0, slash);
+  return url + "/api/health";
+}
+
+void probeApiHealth(bool forceLog = false) {
+  String api = activeApiUrl();
+  if (!api.length()) {
+    lastApiHealthOk = false;
+    lastApiHealthDetail = "no_url";
+    lastHealthUrl = "(empty)";
+    return;
+  }
+  String url = healthUrlFromApi(api);
+  lastHealthUrl = url;
+  HTTPClient http;
+  WiFiClient client;
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) {
+    lastApiHealthOk = false;
+    lastApiHealthDetail = "begin_fail";
+    if (forceLog) addLog("health fail begin " + url);
+    return;
+  }
+  int code = http.GET();
+  http.end();
+  lastApiHealthOk = code >= 200 && code < 300;
+  if (code > 0)
+    lastApiHealthDetail = String(code);
+  else if (code == HTTPC_ERROR_CONNECTION_REFUSED)
+    lastApiHealthDetail = "refused";
+  else if (code == HTTPC_ERROR_CONNECTION_LOST)
+    lastApiHealthDetail = "lost";
+  else
+    lastApiHealthDetail = "begin_fail";
+  if (forceLog) addLog(String("health ") + lastApiHealthDetail + " " + url);
 }
 
 bool callHelper(const char *command, const char *queryId, int64_t afterId, JsonDocument &out) {
@@ -226,7 +314,18 @@ bool callHelper(const char *command, const char *queryId, int64_t afterId, JsonD
 bool postBody(const String &body, int64_t id) {
   pendingBody = body;
   pendingId = id;
-  String url = getPref("api_url", API_DEFAULT_URL);
+  String url = activeApiUrl();
+  lastPostUrl = url.length() ? url : String("(empty)");
+  if (!url.length()) {
+    lastApiOk = false;
+    lastApiDetail = "no_url";
+    addLog("API URL empty - type URL in AlisBoard and Send");
+    return false;
+  }
+  {
+    String stored = getPref("api_url", API_DEFAULT_URL);
+    if (url != stored) prefs.putString("api_url", url);
+  }
   String token = getPref("api_token", API_DEFAULT_TOKEN);
   String auth = token.length() ? ("Bearer " + token) : "";
   String resp;
@@ -240,6 +339,8 @@ bool postBody(const String &body, int64_t id) {
     lastApiDetail = "lost";
   else if (code == HTTPC_ERROR_SEND_HEADER_FAILED)
     lastApiDetail = "send";
+  else if (code < 0)
+    lastApiDetail = "begin_fail";
   else
     lastApiDetail = String(code);
   if (lastApiOk) {
@@ -251,19 +352,12 @@ bool postBody(const String &body, int64_t id) {
       prefs.putLong64("last_id", lastId);
     }
     if (sqlSync)
-      addLog("sql_sync POST ok");
+      addLog("sql_sync POST ok " + url);
     else
-      addLog(String("sent id=") + id);
+      addLog(String("sent id=") + id + " " + url);
     return true;
   }
-  {
-    String host = url;
-    int p = host.indexOf("://");
-    if (p >= 0) host = host.substring(p + 3);
-    p = host.indexOf('/');
-    if (p >= 0) host = host.substring(0, p);
-    addLog("API fail " + lastApiDetail + " " + host + " - retry in 5s");
-  }
+  addLog("API fail " + lastApiDetail + " " + url);
   return false;
 }
 
@@ -295,7 +389,11 @@ void writeStatusFile() {
   doc["wifi_ssid"] = getPref("wifi_ssid", "");
   doc["api_ok"] = lastApiOk;
   doc["api_detail"] = lastApiDetail;
-  doc["api_url"] = getPref("api_url", API_DEFAULT_URL);
+  doc["api_url"] = activeApiUrl();
+  doc["api_post_url"] = lastPostUrl;
+  doc["api_health_ok"] = lastApiHealthOk;
+  doc["api_health_detail"] = lastApiHealthDetail;
+  doc["api_health_url"] = lastHealthUrl;
   doc["sql_connected"] = lastSqlOk;
   for (uint8_t i = 0; i < take; i++) {
     if (i) logjoin += " | ";
@@ -370,7 +468,11 @@ void sendStatus() {
   doc["ap_ip"] = WiFi.softAPIP().toString();
   doc["api_ok"] = lastApiOk;
   doc["api_detail"] = lastApiDetail;
-  doc["api_url"] = getPref("api_url", API_DEFAULT_URL);
+  doc["api_url"] = activeApiUrl();
+  doc["api_post_url"] = lastPostUrl;
+  doc["api_health_ok"] = lastApiHealthOk;
+  doc["api_health_detail"] = lastApiHealthDetail;
+  doc["api_health_url"] = lastHealthUrl;
   doc["helper_url"] = getPref("helper_url", HELPER_DEFAULT_URL);
   doc["sql_server"] = getPref("sql_server", SQL_DEFAULT_SERVER);
   doc["sql_database"] = getPref("sql_db", SQL_DEFAULT_DATABASE);
@@ -420,10 +522,10 @@ void handleWifi() {
 void handleApi() {
   JsonDocument doc;
   deserializeJson(doc, jsonBody());
-  if (doc["url"].is<const char *>()) prefs.putString("api_url", doc["url"].as<String>());
+  if (doc["url"].is<const char *>()) saveApiUrl(doc["url"].as<String>());
+  else if (doc["api_url"].is<const char *>()) saveApiUrl(doc["api_url"].as<String>());
   if (doc["token"].is<const char *>()) prefs.putString("api_token", doc["token"].as<String>());
   if (doc["helper_url"].is<const char *>()) prefs.putString("helper_url", doc["helper_url"].as<String>());
-  addLog("API settings saved");
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -436,22 +538,28 @@ void handleTestSql() {
 }
 
 void handleTestApi() {
-  String url = getPref("api_url", API_DEFAULT_URL);
-  int scheme = url.indexOf("://");
-  String rest = scheme >= 0 ? url.substring(scheme + 3) : url;
-  int slash = rest.indexOf('/');
-  String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
-  int colon = hostPort.indexOf(':');
-  String host = colon >= 0 ? hostPort.substring(0, colon) : hostPort;
-  uint16_t port = 80;
-  if (colon >= 0) port = static_cast<uint16_t>(hostPort.substring(colon + 1).toInt());
-  WiFiClient c;
-  bool ok = c.connect(host.c_str(), port);
-  c.stop();
-  lastApiOk = ok;
-  lastApiDetail = ok ? "tcp_ok" : "tcp_fail";
-  addLog("API probe " + lastApiDetail + " " + host);
-  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  String url = healthUrlFromApi(activeApiUrl());
+  JsonDocument r;
+  r["url"] = url;
+  if (!url.length()) {
+    lastApiHealthOk = false;
+    lastApiHealthDetail = "no_url";
+    lastHealthUrl = "(empty)";
+    r["ok"] = false;
+    r["detail"] = "no_url";
+    addLog("API probe skipped - URL empty");
+    String out;
+    serializeJson(r, out);
+    server.send(200, "application/json", out);
+    return;
+  }
+  probeApiHealth(true);
+  r["ok"] = lastApiHealthOk;
+  r["detail"] = lastApiHealthDetail;
+  r["url"] = lastHealthUrl;
+  String out;
+  serializeJson(r, out);
+  server.send(200, "application/json", out);
 }
 
 }  // namespace
@@ -463,9 +571,11 @@ void setup() {
 
   prefs.begin("alisboard", false);
   lastId = prefs.getLong64("last_id", 0);
+  currentApiUrl = normalizeApiUrl(getPref("api_url", API_DEFAULT_URL));
 
   addLog("AlisBoard " + String(ALISBOARD_VERSION));
   addLog("USB MSC only - run AlisBoard.exe on this disk");
+  addLog("API URL: " + activeApiUrl());
   writeStatusFile();
 }
 
@@ -477,6 +587,12 @@ void loop() {
       if (!wifiLoggedUp) {
         wifiLoggedUp = true;
         addLog("Wi-Fi up " + WiFi.SSID() + " " + WiFi.localIP().toString());
+        addLog("API URL: " + activeApiUrl());
+        probeApiHealth(true);
+        lastHealthMs = millis();
+      } else if (millis() - lastHealthMs >= 20000) {
+        probeApiHealth(false);
+        lastHealthMs = millis();
       }
     } else if (wifiLoggedUp) {
       wifiLoggedUp = false;

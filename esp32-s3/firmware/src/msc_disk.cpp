@@ -150,21 +150,38 @@ void mscBegin() {
 void mscLoop() {}
 
 bool mscTakeInbox(JsonDocument &doc) {
+  static String lastIn;
+  static uint32_t lastPollMs = 0;
+
+  /* Process dirty write (USB cable write-through) */
   if (inDirty && millis() - inMs >= 400) {
     inDirty = false;
     String js = trimJson(inBuf, sizeof(inBuf));
-    if (!js.length()) return false;
-    if (deserializeJson(doc, js)) return false;
+    if (js.length() >= 12 && js.indexOf("\"command\"") >= 0 && js != lastIn) {
+      if (!deserializeJson(doc, js)) {
+        lastIn = js;
+        memset(inBuf, ' ', sizeof(inBuf));
+        memcpy(inBuf, "{}", 2);
+        return true;
+      }
+    }
     memset(inBuf, ' ', sizeof(inBuf));
     memcpy(inBuf, "{}", 2);
-    return true;
+    return false;
   }
+
+  /* Poll every 500ms in case Windows cached the write and inDirty was never set */
+  if (millis() - lastPollMs < 500) return false;
+  lastPollMs = millis();
+
   String js = trimJson(inBuf, sizeof(inBuf));
   if (js.length() < 12 || js.indexOf("\"command\"") < 0) return false;
-  static String lastIn;
   if (js == lastIn) return false;
   if (deserializeJson(doc, js)) return false;
   lastIn = js;
+  /* Clear so it doesn't fire again next poll */
+  memset(inBuf, ' ', sizeof(inBuf));
+  memcpy(inBuf, "{}", 2);
   return true;
 }
 

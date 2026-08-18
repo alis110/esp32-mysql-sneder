@@ -15,6 +15,7 @@ h1{margin:0;font-size:20px}h2{margin:0 0 10px;font-size:13px;color:var(--m);lett
 .wrap{max-width:880px;margin:0 auto;padding:16px 20px 40px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:0 0 12px}
 .row{display:flex;justify-content:space-between;gap:10px;padding:4px 0;font-size:14px}
+.row span:last-child{text-align:right;word-break:break-all}
 .k{color:var(--m)}.ok{color:var(--ok)}.bad{color:var(--bad)}
 label{display:block;color:var(--m);font-size:12px;margin:8px 0 4px}
 input{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0f172a;color:var(--t)}
@@ -34,6 +35,7 @@ button.ghost{background:#0f172a;color:var(--t);border:1px solid var(--line)}
 <div class="row"><span class="k">SQL Server</span><span id="s_sql">…</span></div>
 <div class="row"><span class="k">Wi-Fi</span><span id="s_wifi">…</span></div>
 <div class="row"><span class="k">API</span><span id="s_api">…</span></div>
+<div class="row"><span class="k">API URL</span><span id="s_api_url">…</span></div>
 <div class="row"><span class="k">Last SQL ID</span><span id="s_last">…</span></div>
 </div>
 <div class="card"><h2>SQL Server</h2>
@@ -77,13 +79,14 @@ function paint(s){
   document.getElementById('s_wifi').className=s.wifi_ok?'ok':'bad';
   document.getElementById('s_wifi').textContent=s.wifi_ok?(s.wifi_ip+' · '+s.wifi_ssid):'Not set';
   document.getElementById('s_api').className=s.api_ok?'ok':'bad';
-  document.getElementById('s_api').textContent=s.api_ok?'Online':(s.api_detail||'Unknown');
+  document.getElementById('s_api').textContent=s.api_ok?('OK '+(s.api_detail||'')):(s.api_detail||'Unknown');
+  document.getElementById('s_api_url').textContent=s.api_post_url||s.api_url||'(empty)';
   document.getElementById('s_last').textContent=s.last_id;
   document.getElementById('sql_server').value=s.sql_server||'';
   document.getElementById('sql_db').value=s.sql_database||'';
-  document.getElementById('wifi_ssid').value=s.wifi_ssid||'';
-  document.getElementById('api_url').value=s.api_url||'';
-  document.getElementById('helper_url').value=s.helper_url||'';
+  if(document.activeElement!==document.getElementById('wifi_ssid')) document.getElementById('wifi_ssid').value=s.wifi_ssid||'';
+  if(document.activeElement!==document.getElementById('api_url')) document.getElementById('api_url').value=s.api_url||'';
+  if(document.activeElement!==document.getElementById('helper_url')) document.getElementById('helper_url').value=s.helper_url||'';
   setLogs((s.logs||[]).join('\n'));
 }
 async function tick(){try{paint(await j('/api/status'))}catch(e){setLogs(String(e))}}

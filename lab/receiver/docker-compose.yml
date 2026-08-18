@@ -26,8 +26,8 @@ services:
     container_name: alisboard-api
     # Localhost only — lan_relay.py publishes 0.0.0.0:80 and :18773 for Wi-Fi/ESP.
     ports:
-      - "127.0.0.1:80:80"
-      - "127.0.0.1:18773:80"
+      - "80:80"
+      - "18773:80"
     environment:
       HOST: "0.0.0.0"
       PORT: "80"
