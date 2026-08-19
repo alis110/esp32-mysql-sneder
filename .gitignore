@@ -1,4 +1,4 @@
-# Python
+# Python / venv / cache
 __pycache__/
 *.py[cod]
 *$py.class
@@ -10,19 +10,19 @@ venv/
 *.egg-info/
 .pytest_cache/
 
-# Local secrets / runtime (never commit real credentials)
+# Archived old project (heavy: firmware libs, dist, tools, dumps)
+old/
+
+# Secrets / runtime
 config/config.ini
 firmware/include/secrets.h
 data/*
 !data/.gitkeep
 lab/receiver/data/
-Roshan/sql-data/
 logs/
 *.log
 
-# Build junk (keep .spec and dist EXEs for ready-to-run Windows use)
-build/
-firmware/.pio/
+# ESP32-S3 build artifacts
 esp32-s3/firmware/.pio/
 esp32-s3/firmware/include/msc_image.h
 esp32-s3/helper/*.obj
@@ -32,50 +32,21 @@ esp32-s3/pack/firmware-bin/
 esp32-s3/pack/QUEUE.JSON
 esp32-s3/pack/IN.JSON
 esp32-s3/pack/OUT.JSON
-lab/factory-sim/*.iso
-lab/factory-sim/vm-media/*.bak
-lab/factory-sim/vm-media/*.exe
-Roshan/**/*.mdf
-Roshan/**/*.ldf
-*.iso
+
+# SQL database files (too large; keep .bak tracked)
 *.mdf
 *.ldf
-
-# Offline factory packs (large ~1GB+ toolchains; keep on USB, rebuild with Prepare-OfflinePack.ps1)
-tools/offline/portable-python/
-tools/offline/platformio-home/
-tools/offline/platformio-wheels/
-tools/offline/python-embed.zip
-tools/offline/get-pip.py
-tools/offline/*.zip
-!tools/offline/cp2102/**/*.zip
-
-# Dist runtime leftovers (keep EXEs + service scripts + bats)
-dist/data/
-dist/logs/
-dist/config/config.ini
-dist/firmware/include/secrets.h
-
-# Factory USB pack binaries (README/bats stay tracked)
-system-install/*.exe
-system-install/drivers/
-system-install/firmware-bin/
-system-install/vcredist/
-system-install/updates/
-system-install/*.dll
-system-install/ucrt-x86/
-system-install/config/config.ini
-system-install/firmware/include/secrets.h
-
-# Win7 UCRT DLLs (copied from SysWOW64\downlevel)
-tools/offline/ucrt-x86/*.dll
-
+*.iso
+Roshan/sql-data/
 Roshan/bak_restore/
+Roshan/TagLoggingFast/
+Roshan/TagLoggingSlow/
 Roshan/*.xlsx
 Roshan/*.docx
 Roshan/archive_blocks.csv
 Roshan/._*
-*.bak
+
+# Offline packs / Windows junk
 *.msu
 .idea/
 .vscode/

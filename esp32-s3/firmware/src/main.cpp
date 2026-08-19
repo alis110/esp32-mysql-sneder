@@ -576,6 +576,16 @@ void setup() {
   addLog("AlisBoard " + String(ALISBOARD_VERSION));
   addLog("USB MSC only - run AlisBoard.exe on this disk");
   addLog("API URL: " + activeApiUrl());
+  {
+    String savedSsid = getPref("wifi_ssid", "");
+    if (savedSsid.length()) {
+      addLog("Auto-resume with saved Wi-Fi: " + savedSsid);
+      ensureWifiRadio();
+      connectWifi();
+    } else {
+      addLog("Auto-resume waiting: no saved Wi-Fi yet");
+    }
+  }
   writeStatusFile();
 }
 

@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #pragma comment(lib, "odbc32.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -46,6 +47,7 @@
 #define WM_APP_SQL (WM_APP + 2)
 #define WM_APP_CFG (WM_APP + 3)
 #define WM_APP_ESP (WM_APP + 4)
+#define WM_APP_RELOAD_INI (WM_APP + 5)
 
 #define IDC_USER 101
 #define IDC_SQL 102
@@ -78,15 +80,16 @@ static const char *Q_TLG =
     "ORDER BY u.TimeStamp ASC, u.MS ASC, u.ValueID ASC";
 
 static HWND g_hwnd, g_log, g_esp_log;
-static char g_dir[MAX_PATH];
+static char g_exe_dir[MAX_PATH];
+static char g_esp_dir[MAX_PATH];
 static char g_user[128];
 static char g_sql_status[256] = "SQL: connecting...";
 static char g_esp_status[256] = "ESP: USB disk / COM...";
 static char g_after_id[32] = "0";
 static char g_server[128] = ".\\WINCC";
 static char g_database[128] = "all";
-static char g_ssid[64] = "Alis";
-static char g_pass[64] = "Ali.s1380";
+static char g_ssid[64] = "";
+static char g_pass[64] = "";
 static char g_api[256] = "";
 static char g_token[80] = "lab-token";
 static char g_esp_api_url[256] = "";
@@ -98,6 +101,7 @@ static CRITICAL_SECTION g_sql;
 static volatile int g_run = 1;
 static volatile int g_http_ready = 0;
 static long long g_last_id = 0;
+static int g_show_ui = 0;
 
 static int write_padded(const char *name, const char *json, int size);
 static int read_out_json(char *out, int n);
@@ -105,10 +109,133 @@ static const char *json_str(const char *js, const char *key, char *out, int n);
 static int esp_queue_post(const char *json, char *err, int en);
 static void serial_write_line(const char *json);
 static void write_in_json_wifi(void);
+static void maybe_auto_push_esp(const char *esplog, const char *esp_ssid);
+static void save_ini(void);
 static void append_esp_local_line(const char *line);
+static void cfg_dir(char *out, int n);
+static void ini_path(char *out, int n);
+static void sync_pos_path(char *out, int n);
+static const char *esp_root(void);
 static void json_esc(char *dst, int n, const char *src);
 static void sync_gui_to_globals(void);
 static void json_esc(char *dst, int n, const char *src);
+static void logf(const char *fmt, ...);
+
+static int has_arg(const char *cmd, const char *arg) {
+    const char *p;
+    int n;
+    if (!cmd || !arg || !arg[0]) return 0;
+    n = (int)strlen(arg);
+    p = cmd;
+    while ((p = strstr(p, arg)) != NULL) {
+        int left_ok = (p == cmd) || p[-1] == ' ' || p[-1] == '\t' || p[-1] == '"';
+        int right_ok = p[n] == 0 || p[n] == ' ' || p[n] == '\t' || p[n] == '"';
+        if (left_ok && right_ok) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+static int file_exists_a(const char *path) {
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int looks_like_esp_drive_root(const char *root_no_slash) {
+    char p1[MAX_PATH], p2[MAX_PATH], p3[MAX_PATH];
+    snprintf(p1, sizeof(p1), "%s\\IN.JSON", root_no_slash);
+    snprintf(p2, sizeof(p2), "%s\\OUT.JSON", root_no_slash);
+    snprintf(p3, sizeof(p3), "%s\\QUEUE.JSON", root_no_slash);
+    return file_exists_a(p1) || file_exists_a(p2) || file_exists_a(p3);
+}
+
+static int detect_esp_drive(char *out, int n) {
+    char root[4] = "C:\\";
+    char cand[MAX_PATH];
+    char p1[MAX_PATH], p2[MAX_PATH], p3[MAX_PATH];
+    DWORD dt;
+    char d;
+    for (d = 'D'; d <= 'Z'; d++) {
+        root[0] = d;
+        dt = GetDriveTypeA(root);
+        if (dt != DRIVE_REMOVABLE && dt != DRIVE_FIXED) continue;
+        snprintf(cand, sizeof(cand), "%c:", d);
+        snprintf(p1, sizeof(p1), "%s\\IN.JSON", cand);
+        snprintf(p2, sizeof(p2), "%s\\OUT.JSON", cand);
+        snprintf(p3, sizeof(p3), "%s\\QUEUE.JSON", cand);
+        if (file_exists_a(p1) && file_exists_a(p2) && file_exists_a(p3)) {
+            snprintf(out, n, "%s", cand);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void cfg_dir(char *out, int n) {
+    char appdata[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appdata) != S_OK) {
+        snprintf(out, n, "%s", g_exe_dir);
+        return;
+    }
+    snprintf(out, n, "%s\\AlisBoard", appdata);
+    CreateDirectoryA(out, NULL);
+}
+
+static void ini_path(char *out, int n) {
+    char dir[MAX_PATH];
+    cfg_dir(dir, sizeof(dir));
+    snprintf(out, n, "%s\\alisboard.ini", dir);
+}
+
+static void sync_pos_path(char *out, int n) {
+    char dir[MAX_PATH];
+    cfg_dir(dir, sizeof(dir));
+    snprintf(out, n, "%s\\SYNC.POS", dir);
+}
+
+static void ensure_esp_work_dir(void) {
+    char found[MAX_PATH];
+    static char last_seen[MAX_PATH];
+    if (g_esp_dir[0] && !looks_like_esp_drive_root(g_esp_dir)) g_esp_dir[0] = 0;
+    if (g_esp_dir[0] && looks_like_esp_drive_root(g_esp_dir)) return;
+    if (looks_like_esp_drive_root(g_exe_dir)) {
+        snprintf(g_esp_dir, sizeof(g_esp_dir), "%s", g_exe_dir);
+        return;
+    }
+    if (!detect_esp_drive(found, sizeof(found))) return;
+    if (_stricmp(found, g_esp_dir) != 0) {
+        snprintf(g_esp_dir, sizeof(g_esp_dir), "%s", found);
+        if (_stricmp(last_seen, found) != 0) {
+            snprintf(last_seen, sizeof(last_seen), "%s", found);
+            logf("ESP disk detected at %s (auto-path)", g_esp_dir);
+        }
+    }
+}
+
+static const char *esp_root(void) {
+    ensure_esp_work_dir();
+    if (g_esp_dir[0] && looks_like_esp_drive_root(g_esp_dir)) return g_esp_dir;
+    if (looks_like_esp_drive_root(g_exe_dir)) return g_exe_dir;
+    return NULL;
+}
+
+static void ensure_autostart_hidden(void) {
+    HKEY k = NULL;
+    char exe[MAX_PATH + 4];
+    char val[MAX_PATH + 32];
+    DWORD type = 0, cb = sizeof(val);
+    LONG rc = RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                              0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &k, NULL);
+    if (rc != ERROR_SUCCESS || !k) return;
+    exe[0] = 0;
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    snprintf(val, sizeof(val), "\"%s\" --hidden", exe);
+    if (RegQueryValueExA(k, "AlisBoard", NULL, &type, (BYTE *)exe, &cb) != ERROR_SUCCESS ||
+        type != REG_SZ || _stricmp(exe, val) != 0) {
+        RegSetValueExA(k, "AlisBoard", 0, REG_SZ, (const BYTE *)val, (DWORD)strlen(val) + 1);
+    }
+    RegCloseKey(k);
+}
 
 static void logf(const char *fmt, ...) {
     char buf[512];
@@ -199,12 +326,12 @@ static void normalize_api_url(char *url, int n) {
     }
 }
 
-static void load_ini(void) {
-    char path[MAX_PATH], line[384];
+static int load_ini_from(const char *path) {
+    char line[384];
     FILE *f;
-    snprintf(path, sizeof(path), "%s\\alisboard.ini", g_dir);
+    if (!path || !path[0]) return 0;
     f = fopen(path, "r");
-    if (!f) return;
+    if (!f) return 0;
     while (fgets(line, sizeof(line), f)) {
         trim_cr(line);
         if (!strncmp(line, "api=", 4))
@@ -221,6 +348,26 @@ static void load_ini(void) {
             snprintf(g_database, sizeof(g_database), "%s", line + 9);
     }
     fclose(f);
+    return 1;
+}
+
+static void load_ini(void) {
+    char path[MAX_PATH], legacy[MAX_PATH];
+    int loaded = 0;
+    ini_path(path, sizeof(path));
+    loaded = load_ini_from(path);
+    if (!loaded) {
+        snprintf(legacy, sizeof(legacy), "%s\\alisboard.ini", g_exe_dir);
+        loaded = load_ini_from(legacy);
+        if (!loaded) {
+            ensure_esp_work_dir();
+            if (g_esp_dir[0]) {
+                snprintf(legacy, sizeof(legacy), "%s\\alisboard.ini", g_esp_dir);
+                loaded = load_ini_from(legacy);
+            }
+        }
+        if (loaded) save_ini();
+    }
     normalize_api_url(g_api, sizeof(g_api));
 }
 
@@ -229,7 +376,7 @@ static void save_ini(void) {
     FILE *f;
     sync_gui_to_globals();
     normalize_api_url(g_api, sizeof(g_api));
-    snprintf(path, sizeof(path), "%s\\alisboard.ini", g_dir);
+    ini_path(path, sizeof(path));
     f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "server=%s\ndatabase=%s\napi=%s\nssid=%s\npass=%s\ntoken=%s\n",
@@ -347,7 +494,7 @@ static void build_status_json(char *out, int n) {
     sync_gui_to_globals();
     json_esc(eserver, sizeof(eserver), g_server);
     json_esc(edb, sizeof(edb), g_database);
-    json_esc(ef, sizeof(ef), g_dir);
+    json_esc(ef, sizeof(ef), g_esp_dir[0] ? g_esp_dir : g_exe_dir);
     json_esc(eapi, sizeof(eapi), g_api);
     json_esc(essid, sizeof(essid), g_ssid);
     json_esc(elog, sizeof(elog), logbuf);
@@ -408,7 +555,9 @@ static int write_padded(const char *name, const char *json, int size) {
     HANDLE h;
     DWORD wr = 0;
     int len;
-    snprintf(path, sizeof(path), "%s\\%s", g_dir, name);
+    const char *root = esp_root();
+    if (!root) return 0;
+    snprintf(path, sizeof(path), "%s\\%s", root, name);
     buf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
     if (!buf) return 0;
     len = (int)strlen(json);
@@ -434,7 +583,9 @@ static int read_out_json(char *out, int n) {
     char path[MAX_PATH];
     HANDLE h;
     DWORD rd = 0;
-    snprintf(path, sizeof(path), "%s\\OUT.JSON", g_dir);
+    const char *root = esp_root();
+    if (!root) return 0;
+    snprintf(path, sizeof(path), "%s\\OUT.JSON", root);
     h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                     FILE_FLAG_NO_BUFFERING, NULL);
     if (h == INVALID_HANDLE_VALUE) {
@@ -1007,19 +1158,31 @@ static void sync_dbents(DbEnt *fresh, int nf) {
 
 static int list_user_db_ents(SQLHDBC dbc, DbEnt *ents, int maxn) {
     SQLHSTMT st = NULL;
-    char name[128];
+    char name[128], csec[40];
     int n = 0;
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
-    if (!SQL_SUCCEEDED(SQLExecDirectA(st, (SQLCHAR *)"SELECT name FROM sys.databases WHERE database_id > 4", SQL_NTS))) {
+    if (!SQL_SUCCEEDED(SQLExecDirectA(
+            st,
+            (SQLCHAR *)"SELECT name, DATEDIFF(second,'19700101',create_date) "
+                       "FROM sys.databases WHERE database_id > 4",
+            SQL_NTS))) {
         SQLFreeHandle(SQL_HANDLE_STMT, st);
         return 0;
     }
     while (SQL_SUCCEEDED(SQLFetch(st)) && n < maxn) {
         name[0] = 0;
+        csec[0] = 0;
         SQLGetData(st, 1, SQL_C_CHAR, name, sizeof(name), NULL);
+        SQLGetData(st, 2, SQL_C_CHAR, csec, sizeof(csec), NULL);
         if (name[0] && !skip_sys_db(name)) {
+            unsigned long long t = 0;
             snprintf(ents[n].name, 128, "%s", name);
-            ents[n].t = db_name_time(name);
+            if (csec[0]) {
+                long long sec = _atoi64(csec);
+                if (sec > 0 && sec < 5000000000LL) t = (unsigned long long)sec * 100ULL;
+            }
+            if (!t) t = db_name_time(name);
+            ents[n].t = t;
             ents[n].kind = classify_db(name);
             n++;
         }
@@ -1188,12 +1351,23 @@ static void ident_name(const char *in, char *out, int n) {
 }
 
 static void cursor_load(void) {
-    char path[MAX_PATH], line[320];
+    char path[MAX_PATH], legacy[MAX_PATH], line[320];
     FILE *f;
     if (g_cursor_loaded) return;
     g_cursor_loaded = 1;
-    snprintf(path, sizeof(path), "%s\\SYNC.POS", g_dir);
+    sync_pos_path(path, sizeof(path));
     f = fopen(path, "r");
+    if (!f) {
+        snprintf(legacy, sizeof(legacy), "%s\\SYNC.POS", g_exe_dir);
+        f = fopen(legacy, "r");
+        if (!f) {
+            ensure_esp_work_dir();
+            if (g_esp_dir[0]) {
+                snprintf(legacy, sizeof(legacy), "%s\\SYNC.POS", g_esp_dir);
+                f = fopen(legacy, "r");
+            }
+        }
+    }
     if (!f) return;
     while (fgets(line, sizeof(line), f) && g_cn < CURSOR_MAX) {
         char *tab = strchr(line, '\t');
@@ -1215,7 +1389,7 @@ static void cursor_save(void) {
     char path[MAX_PATH];
     FILE *f;
     int i;
-    snprintf(path, sizeof(path), "%s\\SYNC.POS", g_dir);
+    sync_pos_path(path, sizeof(path));
     f = fopen(path, "w");
     if (!f) return;
     for (i = 0; i < g_cn; i++) fprintf(f, "%s\t%s\n", g_ckey[i], g_cval[i]);
@@ -1602,6 +1776,38 @@ static void send_wifi(void) {
     if (g_hwnd) SetDlgItemTextA(g_hwnd, IDC_API, g_api);
     logf("Box API URL (after normalize): %s", g_api[0] ? g_api : "(empty)");
     write_in_json_wifi();
+    save_ini();
+}
+
+static void maybe_auto_push_esp(const char *esplog, const char *esp_ssid) {
+    static DWORD last_push;
+    static char last_sig[96];
+    char sig[96];
+    DWORD now = GetTickCount();
+    int need = 0;
+
+    if (!g_ssid[0] || !g_api[0]) return;
+    if (!esp_root()) return;
+
+    if (!esp_ssid[0]) need = 1;
+    if (esplog[0] && strstr(esplog, "no saved Wi-Fi") != NULL) need = 1;
+    if (esplog[0] && strstr(esplog, "Wi-Fi: no SSID saved") != NULL) need = 1;
+    if (g_api[0] && g_esp_api_url[0] && strcmp(g_api, g_esp_api_url) != 0) need = 1;
+    if (esplog[0] && strstr(esplog, "API URL saved:") == NULL && strstr(esplog, "API URL: http") == NULL &&
+        strstr(esplog, "0s AlisBoard") != NULL)
+        need = 1;
+
+    if (!need) return;
+
+    snprintf(sig, sizeof(sig), "%s|%s", esp_ssid, esplog[0] ? esplog : "?");
+    if (!strcmp(sig, last_sig) && now - last_push < 30000) return;
+    if (now - last_push < 8000) return;
+
+    last_push = now;
+    snprintf(last_sig, sizeof(last_sig), "%s", sig);
+    logf("Auto-push Wi-Fi/API to ESP from saved PC config");
+    write_in_json_wifi();
+    save_ini();
 }
 
 static void write_in_json_wifi(void) {
@@ -1639,6 +1845,7 @@ static void write_in_json_wifi(void) {
         Sleep(260);
         write_padded("IN.JSON", js, IN_SIZE);
         append_esp_local_line("IN.JSON write repeat OK");
+        save_ini();
     } else {
         logf("IN.JSON not on this folder (plug ESP disk)");
         append_esp_local_line("IN.JSON write FAIL - plug ESP USB disk");
@@ -1842,6 +2049,7 @@ static DWORD WINAPI out_watch(LPVOID p) {
                     HeapFree(GetProcessHeap(), 0, heap);
                 }
             }
+            maybe_auto_push_esp(esplog, ssid);
         }
         if (g_hwnd) PostMessage(g_hwnd, WM_APP_SQL, 1, 0);
         Sleep(1000);
@@ -2047,9 +2255,9 @@ static void layout(void) {
     y = 156;
     ui_group("SQL Server (Windows Authentication, no password)", m, y, w, 96);
     ui_ctrl("STATIC", "Server", 0, m + 16, y + 26, 56, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", ".\\WINCC", WS_BORDER | ES_AUTOHSCROLL, m + 76, y + 24, 220, 24, IDC_SERVER, g_font_ui);
+    ui_ctrl("EDIT", g_server, WS_BORDER | ES_AUTOHSCROLL, m + 76, y + 24, 220, 24, IDC_SERVER, g_font_ui);
     ui_ctrl("STATIC", "Database", 0, m + 310, y + 26, 64, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "all", WS_BORDER | ES_AUTOHSCROLL, m + 378, y + 24, 160, 24, IDC_DB, g_font_ui);
+    ui_ctrl("EDIT", g_database, WS_BORDER | ES_AUTOHSCROLL, m + 378, y + 24, 160, 24, IDC_DB, g_font_ui);
     ui_ctrl("BUTTON", "Test SQL", BS_PUSHBUTTON, m + 556, y + 22, 100, 28, IDC_TEST, g_font_ui);
     ui_ctrl("STATIC", "PC reads SQL only. ESP POSTs batches to the API URL via Wi-Fi after Send.", 0,
             m + 16, y + 58, w - 32, 18, 0, g_font_ui);
@@ -2057,14 +2265,14 @@ static void layout(void) {
     y = 262;
     ui_group("Mill API + Wi-Fi (ESP over Wi-Fi)", m, y, w, 178);
     ui_ctrl("STATIC", "API URL", 0, m + 16, y + 26, 88, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 24, 430, 24, IDC_API, g_font_ui);
+    ui_ctrl("EDIT", g_api, WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 24, 430, 24, IDC_API, g_font_ui);
     ui_ctrl("STATIC", "Token", 0, m + 16, y + 56, 88, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "lab-token", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 108, y + 54, 180, 24, IDC_TOKEN,
+    ui_ctrl("EDIT", g_token, WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 108, y + 54, 180, 24, IDC_TOKEN,
             g_font_ui);
     ui_ctrl("STATIC", "Wi-Fi SSID", 0, m + 16, y + 86, 88, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "Alis", WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 84, 180, 24, IDC_SSID, g_font_ui);
+    ui_ctrl("EDIT", g_ssid, WS_BORDER | ES_AUTOHSCROLL, m + 108, y + 84, 180, 24, IDC_SSID, g_font_ui);
     ui_ctrl("STATIC", "Password", 0, m + 310, y + 86, 64, 18, 0, g_font_ui);
-    ui_ctrl("EDIT", "Ali.s1380", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 378, y + 84, 160, 24, IDC_PASS, g_font_ui);
+    ui_ctrl("EDIT", g_pass, WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, m + 378, y + 84, 160, 24, IDC_PASS, g_font_ui);
     ui_ctrl("BUTTON", "Send to ESP32-S3", BS_PUSHBUTTON, m + 556, y + 80, 130, 28, IDC_SEND, g_font_ui);
     ui_ctrl("BUTTON", "Exit", BS_PUSHBUTTON, m + 692, y + 80, 52, 28, IDC_EXIT, g_font_ui);
     ui_ctrl("STATIC",
@@ -2130,6 +2338,10 @@ static LRESULT CALLBACK wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetDlgItemTextA(h, IDC_API_USED, g_esp_api_url[0] ? g_esp_api_url : "(waiting for ESP - this is the real POST URL)");
         return 0;
     case WM_APP_CFG:
+        apply_globals_to_gui();
+        return 0;
+    case WM_APP_RELOAD_INI:
+        load_ini();
         apply_globals_to_gui();
         return 0;
     case WM_APP_ESP:
@@ -2206,13 +2418,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     HWND h;
     MSG msg;
     (void)prev;
-    (void)cmd;
+    g_show_ui = has_arg(cmd, "--show") || has_arg(cmd, "/show");
+    if (has_arg(cmd, "--hidden") || has_arg(cmd, "/hidden")) g_show_ui = 0;
     InitCommonControls();
     srand((unsigned)GetTickCount());
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_sql);
     windows_user(g_user, sizeof(g_user));
-    exe_dir(g_dir, sizeof(g_dir));
+    exe_dir(g_exe_dir, sizeof(g_exe_dir));
+    ensure_autostart_hidden();
     load_ini();
     init_ui_resources();
     memset(&wc, 0, sizeof(wc));
@@ -2226,19 +2440,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     RegisterClassA(&wc);
     h = FindWindowA(APP_NAME, NULL);
     if (h) {
-        ShowWindow(h, SW_RESTORE);
-        SetForegroundWindow(h);
+        PostMessage(h, WM_APP_RELOAD_INI, 0, 0);
+        ShowWindow(h, g_show_ui ? SW_RESTORE : SW_SHOW);
+        if (g_show_ui) SetForegroundWindow(h);
         return 0;
     }
     h = CreateWindowExA(WS_EX_COMPOSITED, APP_NAME, "AlisBoard " APP_VER,
                         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                         40, 40, 796, 790, NULL, NULL, inst, NULL);
-    ShowWindow(h, SW_SHOWNORMAL);
-    SetForegroundWindow(h);
-    UpdateWindow(h);
-    logf("AlisBoard %s - nothing is installed on Windows", APP_VER);
+    ShowWindow(h, g_show_ui ? SW_SHOWNORMAL : SW_HIDE);
+    if (g_show_ui) {
+        SetForegroundWindow(h);
+        UpdateWindow(h);
+    }
+    logf("AlisBoard %s - auto-run hidden on Windows startup", APP_VER);
     logf("Windows user: %s", g_user);
-    logf("Folder: %s", g_dir);
+    {
+        char cfg[MAX_PATH];
+        cfg_dir(cfg, sizeof(cfg));
+        logf("Config saved in: %s", cfg);
+    }
+    logf("Exe folder: %s", g_exe_dir);
     logf("API URL in this window: %s", g_api[0] ? g_api : "(empty - type IP or full URL then Send)");
     logf("ESP API URL line shows the address the board actually POSTs to.");
     CreateThread(NULL, 0, serial_thread, NULL, 0, NULL);

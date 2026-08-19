@@ -1,9 +1,0 @@
-Microsoft Visual C++ Redistributable (VS 2015–2022)
-Official offline installers for clean Windows PCs running PLCBridge EXEs.
-
-Downloaded from:
-- https://aka.ms/vs/17/release/vc_redist.x64.exe
-- https://aka.ms/vs/17/release/vc_redist.x86.exe
-
-Docs:
-https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist

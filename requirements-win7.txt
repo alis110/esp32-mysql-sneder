@@ -1,6 +1,0 @@
-# Windows 7 32-bit build (Python 3.8 x86). Do not use for the 64-bit Win10 build.
-pyodbc==4.0.39
-pyserial==3.5
-pywin32==306
-pyinstaller==5.13.2
-esptool==4.7.0

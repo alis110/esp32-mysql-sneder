@@ -5,4 +5,4 @@ if not exist "%~dp0AlisBoard.exe" (
   pause
   exit /b 1
 )
-start "" "%~dp0AlisBoard.exe"
+start "" "%~dp0AlisBoard.exe" --show
